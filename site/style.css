@@ -10,8 +10,36 @@ body {
     color: #333;
 }
 
+nav {
+    background-color: #ffffff;
+    padding: 1rem 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.logo {
+    font-weight: bold;
+    font-size: 1.2rem;
+}
+
+nav ul {
+    list-style: none;
+    display: flex;
+    gap: 1rem;
+    margin: 0;
+    padding: 0;
+}
+
+nav a {
+    text-decoration: none;
+    color: #333;
+    font-weight: 500;
+}
+
 header.hero {
-    background: url('../Screenshot 2025-05-29 165753.png') center/cover no-repeat;
+    background: url('images/hero-background.png') center/cover no-repeat;
     height: 60vh;
     display: flex;
     align-items: center;
@@ -75,6 +103,15 @@ section {
     border-radius: 4px;
     text-decoration: none;
     font-weight: bold;
+}
+
+.usage ul {
+    padding: 0 1.5rem;
+    list-style: square inside;
+}
+
+.usage li {
+    margin-bottom: 0.5rem;
 }
 
 footer {
