@@ -1,6 +1,5 @@
 from typing import Dict, Generator, Iterable, List, Optional, TypeVar
 
-from typing import Generator, Iterable, List, TypeVar
 import numpy as np
 import supervision as sv
 import torch
@@ -24,22 +23,30 @@ def create_batches(sequence: Iterable[V], batch_size: int) -> Generator[List[V],
         yield current_batch
 
 class TeamClassifier:
-    def __init__(self, device: str = 'cpu', batch_size: int = 32):
+    def __init__(
+        self,
+        device: str = 'cpu',
+        batch_size: int = 32,
+        model_path: Optional[str] = None,
+    ):
         """
         Initialize the TeamClassifier with device and batch size.
 
         Args:
             device (str): The device to run the model on ('cpu' or 'cuda').
             batch_size (int): The batch size for processing images.
+            model_path (Optional[str]): Path or HuggingFace identifier for the
+                SigLIP vision model.  Defaults to ``SIGLIP_MODEL_PATH``.
         """
+        _model_path = model_path or SIGLIP_MODEL_PATH
         self.device = device
         self.batch_size = batch_size
-        self.features_model = SiglipVisionModel.from_pretrained(SIG_LIP_MODEL_PATH if 'SIG_LIP_MODEL_PATH' in globals() else SIGLIP_MODEL_PATH).to(device)
-        
+        self.features_model = SiglipVisionModel.from_pretrained(_model_path).to(device)
+
         if "cuda" in device:
             self.features_model = self.features_model.half()
-            
-        self.processor = AutoProcessor.from_pretrained(SIG_LIP_MODEL_PATH if 'SIG_LIP_MODEL_PATH' in globals() else SIGLIP_MODEL_PATH)
+
+        self.processor = AutoProcessor.from_pretrained(_model_path)
         self.reducer = umap.UMAP(n_components=3)
         self.cluster_model = KMeans(n_clusters=2, n_init=10)
 
@@ -58,9 +65,6 @@ class TeamClassifier:
         if len(crops) == 0:
             return np.array([])
 
-        if not crops:
-            return np.array([])
-            
         crops = [sv.cv2_to_pillow(crop) for crop in crops]
         batches = list(create_batches(crops, self.batch_size))
         data = []
@@ -292,4 +296,3 @@ class PlayerReIdentifier:
         if all_ids:
             return max(all_ids) + 1
         return 0
-        return self.cluster_model.predict(projections)

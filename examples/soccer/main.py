@@ -444,14 +444,13 @@ def run_team_classification(
     team_classifier.fit(crops)
 
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
-    tracker = sv.ByteTrack(minimum_consecutive_frames=3)
-    track_team_cache: Dict[int, int] = {}
     tracker = sv.ByteTrack(
-    track_activation_threshold=0.25,
-    lost_track_buffer=30,
-    minimum_matching_threshold=0.8,
-    minimum_consecutive_frames=3
-)
+        track_activation_threshold=0.25,
+        lost_track_buffer=30,
+        minimum_matching_threshold=0.8,
+        minimum_consecutive_frames=3,
+    )
+    track_team_cache: Dict[int, int] = {}
     for frame in frame_generator:
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
@@ -459,7 +458,8 @@ def run_team_classification(
 
         players = detections[detections.class_id == PLAYER_CLASS_ID]
         crops = get_crops(frame, players)
-        players_team_id = team_classifier.predict(crops)
+        players_team_id = _resolve_players_team_with_cache(
+            team_classifier, crops, players.tracker_id, track_team_cache)
 
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
         goalkeepers_team_id = resolve_goalkeepers_team_id(
@@ -523,14 +523,13 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
     team_classifier.fit(crops)
 
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
-    tracker = sv.ByteTrack(minimum_consecutive_frames=3)
-    track_team_cache: Dict[int, int] = {}
     tracker = sv.ByteTrack(
-    track_activation_threshold=0.25,
-    lost_track_buffer=30,
-    minimum_matching_threshold=0.8,
-    minimum_consecutive_frames=3
-)
+        track_activation_threshold=0.25,
+        lost_track_buffer=30,
+        minimum_matching_threshold=0.8,
+        minimum_consecutive_frames=3,
+    )
+    track_team_cache: Dict[int, int] = {}
     for frame in frame_generator:
         result = pitch_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
@@ -540,7 +539,8 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
 
         players = detections[detections.class_id == PLAYER_CLASS_ID]
         crops = get_crops(frame, players)
-        players_team_id = team_classifier.predict(crops)
+        players_team_id = _resolve_players_team_with_cache(
+            team_classifier, crops, players.tracker_id, track_team_cache)
 
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
         goalkeepers_team_id = resolve_goalkeepers_team_id(
