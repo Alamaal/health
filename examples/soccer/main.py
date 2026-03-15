@@ -7,7 +7,6 @@ import os
 import cv2
 import numpy as np
 import supervision as sv
-import torch
 from tqdm import tqdm
 from ultralytics import YOLO
 
@@ -28,8 +27,6 @@ PLAYER_CLASS_ID = 2
 REFEREE_CLASS_ID = 3
 
 STRIDE = 60
-PLAYER_IMGSZ = 640
-BALL_IMGSZ = 640
 CONFIG = SoccerPitchConfiguration()
 
 
@@ -307,10 +304,9 @@ def run_pitch_detection(source_video_path: str, device: str) -> Iterator[np.ndar
     """
     _validate_model_path(PITCH_DETECTION_MODEL_PATH)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
-    use_half = _is_cuda_device(device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     for frame in frame_generator:
-        result = pitch_detection_model(frame, half=use_half, verbose=False)[0]
+        result = pitch_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
 
         annotated_frame = frame.copy()
@@ -332,10 +328,9 @@ def run_player_detection(source_video_path: str, device: str) -> Iterator[np.nda
     """
     _validate_model_path(PLAYER_DETECTION_MODEL_PATH)
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
-    use_half = _is_cuda_device(device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     for frame in frame_generator:
-        result = player_detection_model(frame, imgsz=PLAYER_IMGSZ, half=use_half, verbose=False)[0]
+        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
 
         annotated_frame = frame.copy()
@@ -357,14 +352,22 @@ def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
     """
     _validate_model_path(BALL_DETECTION_MODEL_PATH)
     ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
-    use_half = _is_cuda_device(device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     ball_tracker = BallTracker(buffer_size=20)
     ball_annotator = BallAnnotator(radius=6, buffer_size=10)
 
+    def callback(image_slice: np.ndarray) -> sv.Detections:
+        result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
+        return sv.Detections.from_ultralytics(result)
+
+    slicer = sv.InferenceSlicer(
+        callback=callback,
+        overlap_filter_strategy=sv.OverlapFilter.NONE,
+        slice_wh=(640, 640),
+    )
+
     for frame in frame_generator:
-        result = ball_detection_model(frame, imgsz=BALL_IMGSZ, half=use_half, verbose=False)[0]
-        detections = sv.Detections.from_ultralytics(result).with_nms(threshold=0.1)
+        detections = slicer(frame).with_nms(threshold=0.1)
         detections = ball_tracker.update(detections)
         annotated_frame = frame.copy()
         annotated_frame = ball_annotator.annotate(annotated_frame, detections)
@@ -384,11 +387,15 @@ def run_player_tracking(source_video_path: str, device: str) -> Iterator[np.ndar
     """
     _validate_model_path(PLAYER_DETECTION_MODEL_PATH)
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
-    use_half = _is_cuda_device(device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
-    tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    tracker = sv.ByteTrack(
+    track_activation_threshold=0.25,
+    lost_track_buffer=30,
+    minimum_matching_threshold=0.8,
+    minimum_consecutive_frames=3
+)
     for frame in frame_generator:
-        result = player_detection_model(frame, imgsz=PLAYER_IMGSZ, half=use_half, verbose=False)[0]
+        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = tracker.update_with_detections(detections)
 
@@ -418,13 +425,12 @@ def run_team_classification(
     """
     _validate_model_path(PLAYER_DETECTION_MODEL_PATH)
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
-    use_half = _is_cuda_device(device)
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=stride)
 
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
-        result = player_detection_model(frame, imgsz=PLAYER_IMGSZ, half=use_half, verbose=False)[0]
+        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
 
@@ -440,19 +446,20 @@ def run_team_classification(
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
     track_team_cache: Dict[int, int] = {}
+    tracker = sv.ByteTrack(
+    track_activation_threshold=0.25,
+    lost_track_buffer=30,
+    minimum_matching_threshold=0.8,
+    minimum_consecutive_frames=3
+)
     for frame in frame_generator:
-        result = player_detection_model(frame, imgsz=PLAYER_IMGSZ, half=use_half, verbose=False)[0]
+        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = tracker.update_with_detections(detections)
 
         players = detections[detections.class_id == PLAYER_CLASS_ID]
         crops = get_crops(frame, players)
-        players_team_id = _resolve_players_team_with_cache(
-            team_classifier=team_classifier,
-            crops=crops,
-            tracker_ids=players.tracker_id,
-            team_cache=track_team_cache,
-        )
+        players_team_id = team_classifier.predict(crops)
 
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
         goalkeepers_team_id = resolve_goalkeepers_team_id(
@@ -497,13 +504,12 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
     _validate_model_path(PITCH_DETECTION_MODEL_PATH)
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
-    use_half = _is_cuda_device(device)
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=stride)
 
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
-        result = player_detection_model(frame, imgsz=PLAYER_IMGSZ, half=use_half, verbose=False)[0]
+        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
 
@@ -519,21 +525,22 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
     track_team_cache: Dict[int, int] = {}
+    tracker = sv.ByteTrack(
+    track_activation_threshold=0.25,
+    lost_track_buffer=30,
+    minimum_matching_threshold=0.8,
+    minimum_consecutive_frames=3
+)
     for frame in frame_generator:
-        result = pitch_detection_model(frame, half=use_half, verbose=False)[0]
+        result = pitch_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
-        result = player_detection_model(frame, imgsz=PLAYER_IMGSZ, half=use_half, verbose=False)[0]
+        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = tracker.update_with_detections(detections)
 
         players = detections[detections.class_id == PLAYER_CLASS_ID]
         crops = get_crops(frame, players)
-        players_team_id = _resolve_players_team_with_cache(
-            team_classifier=team_classifier,
-            crops=crops,
-            tracker_ids=players.tracker_id,
-            team_cache=track_team_cache,
-        )
+        players_team_id = team_classifier.predict(crops)
 
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
         goalkeepers_team_id = resolve_goalkeepers_team_id(
