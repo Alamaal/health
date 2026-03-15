@@ -428,6 +428,12 @@ def run_team_classification(
         detections = sv.Detections.from_ultralytics(result)
         crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
 
+    if not crops:
+        raise RuntimeError(
+            "No player crops collected during team-classification pass. "
+            "Ensure the video contains players visible to the detection model."
+        )
+
     team_classifier = TeamClassifier(device=device)
     team_classifier.fit(crops)
 
@@ -501,6 +507,12 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
         detections = sv.Detections.from_ultralytics(result)
         crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
 
+    if not crops:
+        raise RuntimeError(
+            "No player crops collected during radar crop-collection pass. "
+            "Ensure the video contains players visible to the detection model."
+        )
+
     team_classifier = TeamClassifier(device=device)
     team_classifier.fit(crops)
 
@@ -564,6 +576,7 @@ def main(
     device: str,
     mode: Mode,
     stride: int = STRIDE,
+    display: bool = False,
 ) -> None:
     """
     Run soccer video analysis in the specified mode and write the output video.
@@ -575,6 +588,9 @@ def main(
         mode (Mode): Analysis mode to execute.
         stride (int, optional): Frame stride for crop-collection phases.
             Defaults to STRIDE.
+        display (bool, optional): When True, show each annotated frame in an
+            OpenCV window in real time. Press 'q' to quit early.
+            Defaults to False (headless / server-friendly processing).
     """
     if mode == Mode.PITCH_DETECTION:
         frame_generator = run_pitch_detection(
@@ -602,9 +618,12 @@ def main(
         for frame in frame_generator:
             sink.write_frame(frame)
 
-            cv2.imshow("frame", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+            if display:
+                cv2.imshow("frame", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+    if display:
         cv2.destroyAllWindows()
 
 
@@ -631,6 +650,10 @@ if __name__ == '__main__':
         '--stride', type=int, default=STRIDE,
         help=f'Frame stride for crop-collection phases (TEAM_CLASSIFICATION, RADAR). '
              f'Defaults to {STRIDE}.')
+    parser.add_argument(
+        '--display', action='store_true', default=False,
+        help='Show annotated frames in a live OpenCV window during processing. '
+             'Press q to quit early. Disabled by default (headless mode).')
     args = parser.parse_args()
     main(
         source_video_path=args.source_video_path,
@@ -638,4 +661,5 @@ if __name__ == '__main__':
         device=args.device,
         mode=args.mode,
         stride=args.stride,
+        display=args.display,
     )

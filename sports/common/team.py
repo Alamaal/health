@@ -71,8 +71,12 @@ class TeamClassifier:
             crops (List[np.ndarray]): List of image crops.
 
         Returns:
-            np.ndarray: Extracted features as a numpy array.
+            np.ndarray: Extracted features as a numpy array. Returns an empty array
+                with shape ``(0,)`` when *crops* is empty.
         """
+        if len(crops) == 0:
+            return np.array([])
+
         crops = [sv.cv2_to_pillow(crop) for crop in crops]
         batches = create_batches(crops, self.batch_size)
         data = []
@@ -97,7 +101,17 @@ class TeamClassifier:
 
         Args:
             crops (List[np.ndarray]): List of image crops.
+
+        Raises:
+            ValueError: If *crops* is empty. At least one crop is required to fit
+                the classifier.
         """
+        if len(crops) == 0:
+            raise ValueError(
+                "TeamClassifier.fit() requires at least one crop. "
+                "No player crops were collected — check that the video contains "
+                "detectable players and that the player detection model is correct."
+            )
         data = self.extract_features(crops)
         projections = self.reducer.fit_transform(data)
         self.cluster_model.fit(projections)

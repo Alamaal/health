@@ -34,7 +34,11 @@ setuptools.setup(
     extras_require={
         'tests': [
             'pytest',
-        ]
+        ],
+        'soccer': [
+            'torch',
+            'ultralytics',
+        ],
     },
     classifiers=[
         'Development Status :: 4 - Beta',
