@@ -1,6 +1,7 @@
 import argparse
 from enum import Enum
-from typing import Iterator, List
+from typing import Dict, Iterator, List, Optional
+import warnings
 
 import os
 import cv2
@@ -30,6 +31,24 @@ STRIDE = 60
 PLAYER_IMGSZ = 640
 BALL_IMGSZ = 640
 CONFIG = SoccerPitchConfiguration()
+
+
+def _validate_model_path(path: str) -> None:
+    """
+    Validate that a model file exists at the given path.
+
+    Args:
+        path (str): Absolute path to the model file.
+
+    Raises:
+        FileNotFoundError: If the model file does not exist.
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Model file not found: {path}\n"
+            "Run './setup.sh' inside examples/soccer/ to download the required models."
+        )
+
 
 COLORS = ['#FF1493', '#00BFFF', '#FF6347', '#FFD700']
 VERTEX_LABEL_ANNOTATOR = sv.VertexLabelAnnotator(
@@ -100,10 +119,20 @@ def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
 
 
 def _is_cuda_device(device: str) -> bool:
+    """Return True if the given device string refers to a CUDA GPU."""
     return str(device).lower().startswith('cuda')
 
 
-def _safe_tracker_id(value) -> int | None:
+def _safe_tracker_id(value) -> Optional[int]:
+    """
+    Safely convert a tracker ID value to int, returning None for NaN or invalid values.
+
+    Args:
+        value: The tracker ID value to convert.
+
+    Returns:
+        Optional[int]: Integer tracker ID, or None if conversion is not possible.
+    """
     if value is None:
         return None
     try:
@@ -121,8 +150,21 @@ def _resolve_players_team_with_cache(
     team_classifier: TeamClassifier,
     crops: List[np.ndarray],
     tracker_ids,
-    team_cache: dict[int, int],
+    team_cache: Dict[int, int],
 ) -> np.ndarray:
+    """
+    Predict team IDs for player crops, using a cache keyed by tracker ID to avoid
+    redundant inference on already-classified players.
+
+    Args:
+        team_classifier (TeamClassifier): Fitted team classifier.
+        crops (List[np.ndarray]): Cropped images of detected players.
+        tracker_ids: Array of tracker IDs corresponding to each crop (may contain NaN).
+        team_cache (Dict[int, int]): Mutable cache mapping tracker ID to team ID.
+
+    Returns:
+        np.ndarray: Integer array of team IDs (0 or 1) for each crop.
+    """
     if len(crops) == 0:
         return np.array([], dtype=int)
 
@@ -173,8 +215,21 @@ def resolve_goalkeepers_team_id(
     """
     goalkeepers_xy = goalkeepers.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
     players_xy = players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
-    team_0_centroid = players_xy[players_team_id == 0].mean(axis=0)
-    team_1_centroid = players_xy[players_team_id == 1].mean(axis=0)
+    team_0_players = players_xy[players_team_id == 0]
+    team_1_players = players_xy[players_team_id == 1]
+
+    if len(team_0_players) == 0 or len(team_1_players) == 0:
+        warnings.warn(
+            f"Cannot resolve goalkeeper teams: team 0 has {len(team_0_players)} "
+            f"player(s), team 1 has {len(team_1_players)} player(s). "
+            "Assigning all goalkeepers to team 0.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return np.zeros(len(goalkeepers_xy), dtype=int)
+
+    team_0_centroid = team_0_players.mean(axis=0)
+    team_1_centroid = team_1_players.mean(axis=0)
     goalkeepers_team_id = []
     for goalkeeper_xy in goalkeepers_xy:
         dist_0 = np.linalg.norm(goalkeeper_xy - team_0_centroid)
@@ -188,7 +243,34 @@ def render_radar(
     keypoints: sv.KeyPoints,
     color_lookup: np.ndarray
 ) -> np.ndarray:
+    """
+    Render a bird's-eye radar view by projecting player positions onto a pitch diagram.
+
+    Uses homography computed from detected pitch keypoints to transform each player's
+    bottom-centre pixel position to pitch coordinates, then draws those points on a
+    synthetic pitch image.
+
+    Args:
+        detections (sv.Detections): Merged player/goalkeeper/referee detections.
+        keypoints (sv.KeyPoints): Pitch keypoint detections from the pitch model.
+        color_lookup (np.ndarray): Integer array mapping each detection to a colour
+            index (0 = team 1, 1 = team 2, 2 = referee, 3 = other).
+
+    Returns:
+        np.ndarray: Bird's-eye pitch image with player positions annotated.
+            Returns a blank pitch if fewer than 4 keypoints are detected (homography
+            requires at least 4 point correspondences).
+    """
     mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
+    num_keypoints = int(np.sum(mask))
+    if num_keypoints < 4:
+        warnings.warn(
+            f"Insufficient pitch keypoints detected for homography "
+            f"(need 4+, got {num_keypoints}). Returning blank pitch.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return draw_pitch(config=CONFIG)
     transformer = ViewTransformer(
         source=keypoints.xy[0][mask].astype(np.float32),
         target=np.array(CONFIG.vertices)[mask].astype(np.float32)
@@ -223,6 +305,7 @@ def run_pitch_detection(source_video_path: str, device: str) -> Iterator[np.ndar
     Yields:
         Iterator[np.ndarray]: Iterator over annotated frames.
     """
+    _validate_model_path(PITCH_DETECTION_MODEL_PATH)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
     use_half = _is_cuda_device(device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
@@ -247,6 +330,7 @@ def run_player_detection(source_video_path: str, device: str) -> Iterator[np.nda
     Yields:
         Iterator[np.ndarray]: Iterator over annotated frames.
     """
+    _validate_model_path(PLAYER_DETECTION_MODEL_PATH)
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     use_half = _is_cuda_device(device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
@@ -271,6 +355,7 @@ def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
     Yields:
         Iterator[np.ndarray]: Iterator over annotated frames.
     """
+    _validate_model_path(BALL_DETECTION_MODEL_PATH)
     ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
     use_half = _is_cuda_device(device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
@@ -297,6 +382,7 @@ def run_player_tracking(source_video_path: str, device: str) -> Iterator[np.ndar
     Yields:
         Iterator[np.ndarray]: Iterator over annotated frames.
     """
+    _validate_model_path(PLAYER_DETECTION_MODEL_PATH)
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     use_half = _is_cuda_device(device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
@@ -315,21 +401,26 @@ def run_player_tracking(source_video_path: str, device: str) -> Iterator[np.ndar
         yield annotated_frame
 
 
-def run_team_classification(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+def run_team_classification(
+    source_video_path: str, device: str, stride: int = STRIDE
+) -> Iterator[np.ndarray]:
     """
     Run team classification on a video and yield annotated frames with team colors.
 
     Args:
         source_video_path (str): Path to the source video.
         device (str): Device to run the model on (e.g., 'cpu', 'cuda').
+        stride (int, optional): Frame stride used when collecting player crops for
+            team classifier training. Defaults to STRIDE.
 
     Yields:
         Iterator[np.ndarray]: Iterator over annotated frames.
     """
+    _validate_model_path(PLAYER_DETECTION_MODEL_PATH)
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     use_half = _is_cuda_device(device)
     frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=STRIDE)
+        source_path=source_video_path, stride=stride)
 
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
@@ -342,7 +433,7 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
 
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
-    track_team_cache: dict[int, int] = {}
+    track_team_cache: Dict[int, int] = {}
     for frame in frame_generator:
         result = player_detection_model(frame, imgsz=PLAYER_IMGSZ, half=use_half, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
@@ -379,12 +470,30 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
         yield annotated_frame
 
 
-def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iterator[np.ndarray]:
+    """
+    Run the full radar pipeline on a video and yield annotated frames.
+
+    Combines player detection, team classification, player tracking, and pitch
+    detection to produce frames with both player annotations and a bird's-eye radar
+    overlay showing team positions on a miniature pitch diagram.
+
+    Args:
+        source_video_path (str): Path to the source video.
+        device (str): Device to run the models on (e.g., 'cpu', 'cuda').
+        stride (int, optional): Frame stride used when collecting player crops for
+            team classifier training. Defaults to STRIDE.
+
+    Yields:
+        Iterator[np.ndarray]: Iterator over annotated frames with radar overlay.
+    """
+    _validate_model_path(PLAYER_DETECTION_MODEL_PATH)
+    _validate_model_path(PITCH_DETECTION_MODEL_PATH)
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
     use_half = _is_cuda_device(device)
     frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=STRIDE)
+        source_path=source_video_path, stride=stride)
 
     crops = []
     for frame in tqdm(frame_generator, desc='collecting crops'):
@@ -397,7 +506,7 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
 
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
-    track_team_cache: dict[int, int] = {}
+    track_team_cache: Dict[int, int] = {}
     for frame in frame_generator:
         result = pitch_detection_model(frame, half=use_half, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
@@ -449,7 +558,24 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         yield annotated_frame
 
 
-def main(source_video_path: str, target_video_path: str, device: str, mode: Mode) -> None:
+def main(
+    source_video_path: str,
+    target_video_path: str,
+    device: str,
+    mode: Mode,
+    stride: int = STRIDE,
+) -> None:
+    """
+    Run soccer video analysis in the specified mode and write the output video.
+
+    Args:
+        source_video_path (str): Path to the input video file.
+        target_video_path (str): Path where the annotated output video will be saved.
+        device (str): Compute device to use (e.g., 'cpu', 'cuda', 'mps').
+        mode (Mode): Analysis mode to execute.
+        stride (int, optional): Frame stride for crop-collection phases.
+            Defaults to STRIDE.
+    """
     if mode == Mode.PITCH_DETECTION:
         frame_generator = run_pitch_detection(
             source_video_path=source_video_path, device=device)
@@ -464,10 +590,10 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
             source_video_path=source_video_path, device=device)
     elif mode == Mode.TEAM_CLASSIFICATION:
         frame_generator = run_team_classification(
-            source_video_path=source_video_path, device=device)
+            source_video_path=source_video_path, device=device, stride=stride)
     elif mode == Mode.RADAR:
         frame_generator = run_radar(
-            source_video_path=source_video_path, device=device)
+            source_video_path=source_video_path, device=device, stride=stride)
     else:
         raise NotImplementedError(f"Mode {mode} is not implemented.")
 
@@ -483,15 +609,33 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='')
-    parser.add_argument('--source_video_path', type=str, required=True)
-    parser.add_argument('--target_video_path', type=str, required=True)
-    parser.add_argument('--device', type=str, default='cpu')
-    parser.add_argument('--mode', type=Mode, default=Mode.PLAYER_DETECTION)
+    parser = argparse.ArgumentParser(
+        description='Soccer AI: real-time player detection, tracking, team '
+                    'classification and radar visualization.'
+    )
+    parser.add_argument(
+        '--source_video_path', type=str, required=True,
+        help='Path to the input video file.')
+    parser.add_argument(
+        '--target_video_path', type=str, required=True,
+        help='Path where the annotated output video will be saved.')
+    parser.add_argument(
+        '--device', type=str, default='cpu',
+        help="Compute device: 'cpu', 'cuda', or 'mps'. Defaults to 'cpu'.")
+    parser.add_argument(
+        '--mode', type=Mode, default=Mode.PLAYER_DETECTION,
+        choices=list(Mode),
+        help=f"Analysis mode. Choices: {[m.value for m in Mode]}. "
+             f"Defaults to PLAYER_DETECTION.")
+    parser.add_argument(
+        '--stride', type=int, default=STRIDE,
+        help=f'Frame stride for crop-collection phases (TEAM_CLASSIFICATION, RADAR). '
+             f'Defaults to {STRIDE}.')
     args = parser.parse_args()
     main(
         source_video_path=args.source_video_path,
         target_video_path=args.target_video_path,
         device=args.device,
-        mode=args.mode
+        mode=args.mode,
+        stride=args.stride,
     )

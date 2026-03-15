@@ -1,0 +1,12 @@
+numpy
+opencv-python
+protobuf
+scikit-learn
+sentencepiece
+supervision
+tqdm
+transformers
+umap-learn
+
+[tests]
+pytest

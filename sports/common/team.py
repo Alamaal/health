@@ -45,12 +45,12 @@ class TeamClassifier:
     """
     def __init__(self, device: str = 'cpu', batch_size: int = 32):
         """
-       Initialize the TeamClassifier with device and batch size.
+        Initialize the TeamClassifier with device and batch size.
 
-       Args:
-           device (str): The device to run the model on ('cpu' or 'cuda').
-           batch_size (int): The batch size for processing images.
-       """
+        Args:
+            device (str): The device to run the model on ('cpu' or 'cuda').
+            batch_size (int): The batch size for processing images.
+        """
         self.device = device
         self.use_fp16 = str(device).lower().startswith('cuda')
         self.batch_size = batch_size
