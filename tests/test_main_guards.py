@@ -252,3 +252,97 @@ class TestMainDisplayFlag:
                 f"cv2.destroyAllWindows at line {node.lineno} is not guarded by 'if display'"
             )
 
+
+# ---------------------------------------------------------------------------
+# PlayerReIdentifier (functional tests — pure numpy, no GPU required)
+# ---------------------------------------------------------------------------
+
+class TestPlayerReIdentifier:
+    """Verify PlayerReIdentifier stable-ID behaviour."""
+
+    @pytest.fixture
+    def reid_cls(self):
+        """Import PlayerReIdentifier; skip if heavy deps are unavailable."""
+        try:
+            from sports.common.team import PlayerReIdentifier
+        except ImportError:
+            pytest.skip("sports.common.team unavailable (missing heavy deps)")
+        return PlayerReIdentifier
+
+    def test_same_tracker_id_is_stable(self, reid_cls):
+        """A tracker ID seen repeatedly across frames must always return the same canonical ID."""
+        reid = reid_cls(max_frames_lost=100, position_tolerance_px=100)
+        canonical = reid.get_stable_id(5, np.array([200.0, 200.0]), team_id=0)
+        for i in range(20):
+            returned = reid.get_stable_id(5, np.array([200.0 + i, 200.0 + i]), team_id=0)
+            assert returned == canonical, f"Stable ID changed at iteration {i}"
+            reid.end_frame()
+
+    def test_reidentify_after_lost_frame(self, reid_cls):
+        """A new tracker ID that appears close to a recently-lost track should get the old ID."""
+        reid = reid_cls(max_frames_lost=5, position_tolerance_px=100)
+        id_a = reid.get_stable_id(10, np.array([100.0, 200.0]), team_id=0)
+        id_b = reid.get_stable_id(11, np.array([400.0, 300.0]), team_id=1)
+        reid.end_frame()
+
+        # Player B disappears for one frame
+        reid.get_stable_id(10, np.array([105.0, 205.0]), team_id=0)
+        reid.end_frame()
+
+        # New ByteTrack ID 99 appears near B's last position — must re-use id_b
+        id_b_returned = reid.get_stable_id(99, np.array([402.0, 298.0]), team_id=1)
+        assert id_b_returned == id_b, f"Expected re-ID to {id_b}, got {id_b_returned}"
+
+    def test_cross_team_does_not_match(self, reid_cls):
+        """A lost track from team 0 must never be re-used by a new track from team 1."""
+        reid = reid_cls(max_frames_lost=5, position_tolerance_px=100)
+        canon_0 = reid.get_stable_id(1, np.array([100.0, 200.0]), team_id=0)
+        reid.end_frame()  # player 1 (team 0) now lost with age=1
+        # Different-team player at almost the same spot
+        canon_1_team = reid.get_stable_id(2, np.array([102.0, 202.0]), team_id=1)
+        assert canon_1_team != canon_0, (
+            "Cross-team position match incorrectly re-used a different-team canonical ID"
+        )
+
+    def test_far_player_does_not_match(self, reid_cls):
+        """A new track farther than position_tolerance_px must not inherit the old ID."""
+        reid = reid_cls(max_frames_lost=5, position_tolerance_px=100)
+        canon_orig = reid.get_stable_id(1, np.array([100.0, 200.0]), team_id=0)
+        reid.end_frame()
+        canon_far = reid.get_stable_id(2, np.array([500.0, 500.0]), team_id=0)
+        assert canon_far != canon_orig, "Player outside tolerance should not be re-identified"
+
+    def test_gallery_pruning(self, reid_cls):
+        """Tracks absent for >= max_frames_lost frames must be removed from the gallery."""
+        reid = reid_cls(max_frames_lost=2, position_tolerance_px=100)
+        canon_p1 = reid.get_stable_id(1, np.array([100.0, 200.0]), team_id=0)
+        reid.end_frame()    # last seen → age=0
+        reid.end_frame()    # absent  → age=1
+        reid.end_frame()    # absent  → age=2 ≥ max → pruned
+        assert canon_p1 not in reid._gallery, (
+            "Track should be pruned from gallery after max_frames_lost frames of absence"
+        )
+
+    def test_nearest_match_wins(self, reid_cls):
+        """When two lost tracks are within tolerance, the closest one must be selected."""
+        reid = reid_cls(max_frames_lost=10, position_tolerance_px=150)
+        c1 = reid.get_stable_id(1, np.array([100.0, 100.0]), team_id=0)
+        c2 = reid.get_stable_id(2, np.array([200.0, 200.0]), team_id=0)
+        reid.end_frame()  # both active → age=0
+
+        # Frame 2: only player 1 active, player 2 disappears
+        reid.get_stable_id(1, np.array([102.0, 102.0]), team_id=0)
+        reid.end_frame()  # player 2 (c2) gallery age → 1
+
+        # Frame 3: new track 99 near player 2 (distance ~7 px) vs player 1 (far)
+        reid.get_stable_id(1, np.array([104.0, 104.0]), team_id=0)
+        new_c = reid.get_stable_id(99, np.array([205.0, 205.0]), team_id=0)
+        assert new_c == c2, f"Expected nearest match {c2}, got {new_c}"
+
+    def test_team_py_exports_player_reidentifier(self):
+        """PlayerReIdentifier must be importable from sports.common.team."""
+        source = open(_TEAM_PY).read()
+        assert "class PlayerReIdentifier" in source, (
+            "PlayerReIdentifier class not found in sports/common/team.py"
+        )
+
