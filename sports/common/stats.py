@@ -7,7 +7,8 @@ kept here so they can be unit-tested without running an actual video.
 """
 
 from collections import Counter, deque
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -108,6 +109,19 @@ class TeamVoteBuffer:
 
 
 # ---------------------------------------------------------------------------
+# PassEvent
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PassEvent:
+    """Immutable record of a single detected pass."""
+    team_id: int
+    time_sec: float
+    from_player_id: int
+    to_player_id: int
+
+
+# ---------------------------------------------------------------------------
 # PassDetector
 # ---------------------------------------------------------------------------
 
@@ -158,10 +172,23 @@ class PassDetector:
 
         # team_id → timestamp of last accepted pass
         self._last_pass_time: Dict[int, float] = {}
+        # team_id → accumulated pass count
+        self._pass_counts: Dict[int, int] = {}
+        # Most recent pass event, or None
+        self._last_pass_event: Optional["PassEvent"] = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def last_pass_event(self) -> Optional["PassEvent"]:
+        """Return the most recent :class:`PassEvent`, or *None*."""
+        return self._last_pass_event
+
+    def get_pass_count(self, team_id: int) -> int:
+        """Return the total number of passes recorded for *team_id*."""
+        return self._pass_counts.get(team_id, 0)
 
     def check(
         self,
@@ -177,6 +204,9 @@ class PassDetector:
     ) -> bool:
         """
         Return *True* if this owner transition qualifies as a completed pass.
+
+        When a pass is accepted, the per-team pass count is incremented and the
+        :attr:`last_pass_event` property is updated with the event details.
 
         Args:
             prev_canonical_id: Stable canonical ID of the previous ball owner,
@@ -227,11 +257,20 @@ class PassDetector:
 
         # All checks passed — record the pass.
         self._last_pass_time[prev_team_id] = time_sec
+        self._pass_counts[prev_team_id] = self._pass_counts.get(prev_team_id, 0) + 1
+        self._last_pass_event = PassEvent(
+            team_id=prev_team_id,
+            time_sec=time_sec,
+            from_player_id=prev_canonical_id,
+            to_player_id=new_canonical_id,
+        )
         return True
 
     def reset(self) -> None:
-        """Reset the debounce timer (e.g. for unit tests)."""
+        """Reset all internal state (debounce timers, pass counts, last event)."""
         self._last_pass_time.clear()
+        self._pass_counts.clear()
+        self._last_pass_event = None
 
 
 # ---------------------------------------------------------------------------
@@ -311,3 +350,102 @@ class PossessionTracker:
     def reset(self) -> None:
         """Clear all accumulated possession data."""
         self._possession.clear()
+
+
+# ---------------------------------------------------------------------------
+# Video overlay helpers
+# ---------------------------------------------------------------------------
+
+def _format_time(sec: float) -> str:
+    """Format seconds as ``MM:SS``."""
+    m, s = divmod(int(sec), 60)
+    return f"{m:02d}:{s:02d}"
+
+
+def draw_stats_overlay(
+    frame: np.ndarray,
+    pass_detector: PassDetector,
+    possession_tracker: PossessionTracker,
+    frame_index: int,
+    team_labels: Tuple[str, str] = ("Team A", "Team B"),
+) -> np.ndarray:
+    """
+    Draw a semi-transparent statistics panel on the top-left of *frame*.
+
+    Shows per-team pass counts and possession percentages.
+
+    Args:
+        frame: Video frame (BGR, will be modified in-place).
+        pass_detector: Current pass detector with accumulated counts.
+        possession_tracker: Current possession tracker.
+        frame_index: Current frame number (used as total_frames denominator).
+        team_labels: Display names for team 0 and team 1.
+
+    Returns:
+        The annotated frame.
+    """
+    import cv2  # local import to keep module testable without OpenCV
+
+    total = max(frame_index, 1)
+    poss_0 = possession_tracker.possession_pct(0, total)
+    poss_1 = possession_tracker.possession_pct(1, total)
+    passes_0 = pass_detector.get_pass_count(0)
+    passes_1 = pass_detector.get_pass_count(1)
+
+    lines = [
+        f"{team_labels[0]}  Passes: {passes_0}  Poss: {poss_0:.1f}%",
+        f"{team_labels[1]}  Passes: {passes_1}  Poss: {poss_1:.1f}%",
+    ]
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.7
+    thickness = 2
+    pad = 10
+    line_h = 30
+
+    box_w = max(cv2.getTextSize(l, font, scale, thickness)[0][0] for l in lines) + 2 * pad
+    box_h = line_h * len(lines) + 2 * pad
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (box_w, box_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    for i, text in enumerate(lines):
+        y = pad + (i + 1) * line_h
+        cv2.putText(frame, text, (pad, y), font, scale, (255, 255, 255), thickness)
+
+    return frame
+
+
+def draw_pass_label(
+    frame: np.ndarray,
+    pass_event: PassEvent,
+    ball_xy: np.ndarray,
+) -> np.ndarray:
+    """
+    Draw a "PASS" label near the ball at the exact moment a pass is detected.
+
+    Args:
+        frame: Video frame (BGR, modified in-place).
+        pass_event: The pass event with timing information.
+        ball_xy: Ball centre ``[x, y]`` in pixel coordinates.
+
+    Returns:
+        The annotated frame.
+    """
+    import cv2
+
+    ts = _format_time(pass_event.time_sec)
+    label = f"PASS {ts}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.9
+    thickness = 2
+    bx, by = int(ball_xy[0]), int(ball_xy[1])
+
+    (tw, th), _ = cv2.getTextSize(label, font, scale, thickness)
+    tx = max(bx - tw // 2, 0)
+    ty = max(by - 15, th + 5)
+
+    cv2.rectangle(frame, (tx - 4, ty - th - 4), (tx + tw + 4, ty + 4), (0, 0, 0), -1)
+    cv2.putText(frame, label, (tx, ty), font, scale, (0, 255, 255), thickness)
+    return frame

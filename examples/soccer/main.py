@@ -12,7 +12,14 @@ from ultralytics import YOLO
 
 from sports.annotators.soccer import draw_pitch, draw_points_on_pitch
 from sports.common.ball import BallTracker, BallAnnotator
-from sports.common.team import TeamClassifier
+from sports.common.team import TeamClassifier, PlayerReIdentifier
+from sports.common.stats import (
+    PassDetector,
+    PossessionTracker,
+    TeamVoteBuffer,
+    draw_pass_label,
+    draw_stats_overlay,
+)
 from sports.common.view import ViewTransformer
 from sports.configs.soccer import SoccerPitchConfiguration
 
@@ -28,6 +35,11 @@ REFEREE_CLASS_ID = 3
 
 STRIDE = 60
 CONFIG = SoccerPitchConfiguration()
+
+# Maximum ball-to-player distance (px) for possession assignment.
+MAX_OWNER_DIST_PX: float = 80.0
+# Duration (seconds) to keep the "PASS" label visible on screen.
+PASS_LABEL_DISPLAY_SEC: float = 1.0
 
 
 def _validate_model_path(path: str) -> None:
@@ -487,9 +499,15 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
     """
     Run the full radar pipeline on a video and yield annotated frames.
 
-    Combines player detection, team classification, player tracking, and pitch
-    detection to produce frames with both player annotations and a bird's-eye radar
-    overlay showing team positions on a miniature pitch diagram.
+    Combines player detection, team classification, player tracking, pitch
+    detection, **ball tracking**, **pass detection**, and **possession tracking**
+    to produce frames with player annotations, a bird's-eye radar overlay, live
+    statistics (pass counts and possession percentages), and a ``PASS`` label
+    rendered at the exact moment each pass is detected.
+
+    A pass is registered whenever the ball transitions from one player to a
+    *different* player on the **same** team and the transfer passes quality
+    filters (speed, displacement, debounce, ID-switch guard).
 
     Args:
         source_video_path (str): Path to the source video.
@@ -498,12 +516,17 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
             team classifier training. Defaults to STRIDE.
 
     Yields:
-        Iterator[np.ndarray]: Iterator over annotated frames with radar overlay.
+        Iterator[np.ndarray]: Iterator over annotated frames with radar overlay,
+            pass labels and statistics.
     """
     _validate_model_path(PLAYER_DETECTION_MODEL_PATH)
     _validate_model_path(PITCH_DETECTION_MODEL_PATH)
+    _validate_model_path(BALL_DETECTION_MODEL_PATH)
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
+    ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
+
+    # --- First pass: collect crops for team classifier ---
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=stride)
 
@@ -522,6 +545,10 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
     team_classifier = TeamClassifier(device=device)
     team_classifier.fit(crops)
 
+    # --- Second pass: per-frame analysis ---
+    video_info = sv.VideoInfo.from_video_path(source_video_path)
+    fps = video_info.fps or 25.0
+
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(
         track_activation_threshold=0.25,
@@ -529,10 +556,44 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
         minimum_matching_threshold=0.8,
         minimum_consecutive_frames=3,
     )
+
+    # Ball detection slicer
+    def _ball_callback(image_slice: np.ndarray) -> sv.Detections:
+        result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
+        return sv.Detections.from_ultralytics(result)
+
+    ball_slicer = sv.InferenceSlicer(
+        callback=_ball_callback,
+        overlap_filter_strategy=sv.OverlapFilter.NONE,
+        slice_wh=(640, 640),
+    )
+
+    ball_tracker = BallTracker(buffer_size=20)
+    ball_annotator = BallAnnotator(radius=6, buffer_size=10)
+    reid = PlayerReIdentifier(max_frames_lost=90, position_tolerance_px=120)
+    vote_buffer = TeamVoteBuffer(buffer_size=64, min_votes=8)
+    pass_detector = PassDetector(fps=fps)
+    possession_tracker = PossessionTracker(max_owner_dist_px=MAX_OWNER_DIST_PX)
+
     track_team_cache: Dict[int, int] = {}
-    for frame in frame_generator:
+
+    # Per-frame state for pass detection
+    prev_owner_canonical: Optional[int] = None
+    prev_owner_team: int = -1
+    prev_owner_xy: Optional[np.ndarray] = None
+    prev_ball_xy: Optional[np.ndarray] = None
+    ball_origin_xy: Optional[np.ndarray] = None  # ball pos when current owner first got it
+    last_pass_display_until: float = -1.0  # timestamp until which to show PASS label
+    last_pass_ball_xy: Optional[np.ndarray] = None  # ball pos for PASS label
+
+    for frame_idx, frame in enumerate(frame_generator):
+        time_sec = frame_idx / fps
+
+        # --- Pitch keypoints ---
         result = pitch_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
+
+        # --- Player detection & tracking ---
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = tracker.update_with_detections(detections)
@@ -548,23 +609,119 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
 
         referees = detections[detections.class_id == REFEREE_CLASS_ID]
 
-        detections = sv.Detections.merge([players, goalkeepers, referees])
+        # --- Ball detection & tracking ---
+        ball_dets = ball_slicer(frame).with_nms(threshold=0.1)
+        ball_dets = ball_tracker.update(ball_dets)
+        ball_xy: Optional[np.ndarray] = None
+        if len(ball_dets) > 0:
+            ball_xy = ball_dets.get_anchors_coordinates(sv.Position.CENTER)[0]
+
+        # --- Stable IDs (re-identification) & team vote buffering ---
+        all_field_players = sv.Detections.merge([players, goalkeepers])
+        all_field_team_ids = np.concatenate([players_team_id, goalkeepers_team_id]) \
+            if len(goalkeepers) > 0 else players_team_id.copy()
+        all_field_xy = all_field_players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER) \
+            if len(all_field_players) > 0 else np.empty((0, 2))
+
+        canonical_ids = []
+        stable_team_ids = []
+        for i in range(len(all_field_players)):
+            tid = _safe_tracker_id(
+                all_field_players.tracker_id[i]
+                if all_field_players.tracker_id is not None else None
+            )
+            if tid is None:
+                canonical_ids.append(None)
+                stable_team_ids.append(int(all_field_team_ids[i]))
+                continue
+            cid = reid.get_stable_id(tid, all_field_xy[i], team_id=int(all_field_team_ids[i]))
+            canonical_ids.append(cid)
+            stable_team_ids.append(vote_buffer.update(cid, int(all_field_team_ids[i])))
+        reid.end_frame()
+
+        # --- Possession & pass detection ---
+        owner_idx: Optional[int] = None
+        if ball_xy is not None and len(all_field_xy) > 0:
+            dists = np.linalg.norm(all_field_xy - ball_xy, axis=1)
+            nearest = int(np.argmin(dists))
+            if dists[nearest] <= MAX_OWNER_DIST_PX:
+                owner_idx = nearest
+
+        if owner_idx is not None and ball_xy is not None:
+            cur_team = stable_team_ids[owner_idx]
+            cur_canonical = canonical_ids[owner_idx]
+            cur_xy = all_field_xy[owner_idx]
+
+            if cur_team in (0, 1):
+                possession_tracker.update(cur_team, ball_xy, cur_xy)
+
+            # Pass detection: ownership changed?
+            if cur_canonical != prev_owner_canonical and prev_owner_canonical is not None:
+                # Compute ball speed & displacement
+                ball_speed = 0.0
+                ball_disp = 0.0
+                if prev_ball_xy is not None:
+                    dt = 1.0 / fps
+                    ball_speed = float(np.linalg.norm(ball_xy - prev_ball_xy)) / dt
+                if ball_origin_xy is not None:
+                    ball_disp = float(np.linalg.norm(ball_xy - ball_origin_xy))
+
+                is_pass = pass_detector.check(
+                    prev_canonical_id=prev_owner_canonical,
+                    prev_team_id=prev_owner_team,
+                    new_canonical_id=cur_canonical,
+                    new_team_id=cur_team,
+                    prev_player_xy=prev_owner_xy,
+                    new_player_xy=cur_xy,
+                    ball_speed_px_per_sec=ball_speed,
+                    ball_displacement_px=ball_disp,
+                    time_sec=time_sec,
+                )
+                if is_pass:
+                    last_pass_display_until = time_sec + PASS_LABEL_DISPLAY_SEC
+                    last_pass_ball_xy = ball_xy.copy()
+
+                # New owner takes over
+                ball_origin_xy = ball_xy.copy()
+
+            prev_owner_canonical = cur_canonical
+            prev_owner_team = cur_team
+            prev_owner_xy = cur_xy.copy()
+
+        if ball_xy is not None:
+            prev_ball_xy = ball_xy.copy()
+
+        # --- Merge detections for annotation ---
+        merged_detections = sv.Detections.merge([players, goalkeepers, referees])
         color_lookup = np.array(
             players_team_id.tolist() +
             goalkeepers_team_id.tolist() +
             [REFEREE_CLASS_ID] * len(referees)
         )
-        labels = [str(tracker_id) for tracker_id in detections.tracker_id]
+        labels = [str(tracker_id) for tracker_id in merged_detections.tracker_id]
 
+        # --- Annotate frame ---
         annotated_frame = frame.copy()
         annotated_frame = ELLIPSE_ANNOTATOR.annotate(
-            annotated_frame, detections, custom_color_lookup=color_lookup)
+            annotated_frame, merged_detections, custom_color_lookup=color_lookup)
         annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
-            annotated_frame, detections, labels,
+            annotated_frame, merged_detections, labels,
             custom_color_lookup=color_lookup)
+        annotated_frame = ball_annotator.annotate(annotated_frame, ball_dets)
 
+        # --- PASS label ---
+        if time_sec <= last_pass_display_until and last_pass_ball_xy is not None:
+            pe = pass_detector.last_pass_event
+            if pe is not None:
+                annotated_frame = draw_pass_label(annotated_frame, pe, last_pass_ball_xy)
+
+        # --- Stats overlay ---
+        annotated_frame = draw_stats_overlay(
+            annotated_frame, pass_detector, possession_tracker, frame_idx + 1)
+
+        # --- Radar overlay ---
         h, w, _ = frame.shape
-        radar = render_radar(detections, keypoints, color_lookup)
+        radar = render_radar(merged_detections, keypoints, color_lookup)
         radar = sv.resize_image(radar, (w // 2, h // 2))
         radar_h, radar_w, _ = radar.shape
         rect = sv.Rect(
