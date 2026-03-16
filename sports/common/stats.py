@@ -112,7 +112,7 @@ class TeamVoteBuffer:
 # PassEvent
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class PassEvent:
     """Immutable record of a single detected pass."""
     team_id: int
