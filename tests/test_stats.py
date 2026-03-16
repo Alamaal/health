@@ -3,8 +3,11 @@ Unit tests for sports.common.stats module.
 
 Covers:
 - TeamVoteBuffer: temporal team-assignment stabilisation
-- PassDetector: pass quality filters (speed, distance, debounce, ID switch guard)
+- PassDetector: pass quality filters (speed, distance, debounce, ID switch guard),
+  pass counting, and last-pass event tracking
 - PossessionTracker: proximity-weighted possession counting
+- PassEvent: dataclass record of a single pass
+- draw_stats_overlay / draw_pass_label: video overlay helpers
 """
 
 import numpy as np
@@ -12,8 +15,11 @@ import pytest
 
 from sports.common.stats import (
     PassDetector,
+    PassEvent,
     PossessionTracker,
     TeamVoteBuffer,
+    draw_pass_label,
+    draw_stats_overlay,
 )
 
 
@@ -328,3 +334,143 @@ class TestPossessionTracker:
         pt.reset()
         assert pt.weighted_frames(0) == 0.0
         assert pt.possession_pct(0, total_frames=10) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# PassEvent
+# ---------------------------------------------------------------------------
+
+class TestPassEvent:
+    """PassEvent dataclass stores pass details."""
+
+    def test_fields(self):
+        e = PassEvent(team_id=0, time_sec=5.5, from_player_id=1, to_player_id=2)
+        assert e.team_id == 0
+        assert e.time_sec == 5.5
+        assert e.from_player_id == 1
+        assert e.to_player_id == 2
+
+
+# ---------------------------------------------------------------------------
+# PassDetector pass counts & last event
+# ---------------------------------------------------------------------------
+
+class TestPassDetectorCounts:
+    """Pass counting and last_pass_event property."""
+
+    def _make_detector(self, **kwargs):
+        defaults = dict(
+            min_ball_speed_px_per_sec=300.0,
+            pass_debounce_sec=1.35,
+            pass_min_dist_px=85.0,
+            id_switch_guard_px=65.0,
+            fps=25.0,
+        )
+        defaults.update(kwargs)
+        return PassDetector(**defaults)
+
+    def _valid_pass_kwargs(self, time_sec=5.0):
+        return dict(
+            prev_canonical_id=1,
+            prev_team_id=0,
+            new_canonical_id=2,
+            new_team_id=0,
+            prev_player_xy=np.array([100.0, 200.0]),
+            new_player_xy=np.array([300.0, 200.0]),
+            ball_speed_px_per_sec=500.0,
+            ball_displacement_px=200.0,
+            time_sec=time_sec,
+        )
+
+    def test_pass_count_increments(self):
+        """get_pass_count increments when a pass is accepted."""
+        d = self._make_detector()
+        assert d.get_pass_count(0) == 0
+        d.check(**self._valid_pass_kwargs())
+        assert d.get_pass_count(0) == 1
+
+    def test_pass_count_per_team(self):
+        """Pass counts are independent per team."""
+        d = self._make_detector(pass_debounce_sec=0.5)
+        d.check(**self._valid_pass_kwargs(time_sec=0.0))
+        kw1 = self._valid_pass_kwargs(time_sec=2.0)
+        kw1["prev_team_id"] = 1
+        kw1["new_team_id"] = 1
+        kw1["prev_canonical_id"] = 10
+        kw1["new_canonical_id"] = 11
+        d.check(**kw1)
+        assert d.get_pass_count(0) == 1
+        assert d.get_pass_count(1) == 1
+
+    def test_last_pass_event_set(self):
+        """last_pass_event is populated after a successful check."""
+        d = self._make_detector()
+        assert d.last_pass_event is None
+        d.check(**self._valid_pass_kwargs())
+        ev = d.last_pass_event
+        assert ev is not None
+        assert ev.team_id == 0
+        assert ev.time_sec == 5.0
+        assert ev.from_player_id == 1
+        assert ev.to_player_id == 2
+
+    def test_last_pass_event_not_set_on_reject(self):
+        """last_pass_event stays None when a pass is rejected."""
+        d = self._make_detector()
+        kw = self._valid_pass_kwargs()
+        kw["ball_speed_px_per_sec"] = 10.0  # too slow
+        d.check(**kw)
+        assert d.last_pass_event is None
+
+    def test_reset_clears_counts_and_event(self):
+        """reset() clears pass counts and last_pass_event."""
+        d = self._make_detector()
+        d.check(**self._valid_pass_kwargs())
+        assert d.get_pass_count(0) == 1
+        assert d.last_pass_event is not None
+        d.reset()
+        assert d.get_pass_count(0) == 0
+        assert d.last_pass_event is None
+
+
+# ---------------------------------------------------------------------------
+# draw_stats_overlay & draw_pass_label
+# ---------------------------------------------------------------------------
+
+class TestOverlayHelpers:
+    """Video overlay drawing helpers."""
+
+    def _dummy_frame(self):
+        return np.zeros((480, 640, 3), dtype=np.uint8)
+
+    def test_draw_stats_overlay_returns_frame(self):
+        """draw_stats_overlay returns an ndarray of the same shape."""
+        frame = self._dummy_frame()
+        d = PassDetector()
+        pt = PossessionTracker()
+        result = draw_stats_overlay(frame, d, pt, frame_index=100)
+        assert isinstance(result, np.ndarray)
+        assert result.shape == frame.shape
+
+    def test_draw_stats_overlay_writes_pixels(self):
+        """draw_stats_overlay modifies pixels (not a no-op)."""
+        frame = self._dummy_frame()
+        d = PassDetector()
+        pt = PossessionTracker()
+        draw_stats_overlay(frame, d, pt, frame_index=100)
+        assert frame.sum() > 0
+
+    def test_draw_pass_label_returns_frame(self):
+        """draw_pass_label returns an ndarray of the same shape."""
+        frame = self._dummy_frame()
+        ev = PassEvent(team_id=0, time_sec=3.5, from_player_id=1, to_player_id=2)
+        result = draw_pass_label(frame, ev, np.array([320.0, 240.0]))
+        assert isinstance(result, np.ndarray)
+        assert result.shape == frame.shape
+
+    def test_draw_pass_label_writes_pixels(self):
+        """draw_pass_label modifies pixels."""
+        frame = self._dummy_frame()
+        ev = PassEvent(team_id=0, time_sec=3.5, from_player_id=1, to_player_id=2)
+        draw_pass_label(frame, ev, np.array([320.0, 240.0]))
+        assert frame.sum() > 0
