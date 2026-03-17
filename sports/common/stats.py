@@ -1,9 +1,10 @@
 """
 Match statistics helpers for soccer video analysis.
 
-Provides pass detection with quality filters and possession tracking with
-proximity weighting.  These helpers are used by the analysis notebook but are
-kept here so they can be unit-tested without running an actual video.
+Provides pass detection with quality filters, possession tracking with
+proximity weighting, and pitch heatmap generation utilities.  These helpers
+are used by the analysis notebook but are kept here so they can be
+unit-tested without running an actual video.
 """
 
 from collections import Counter, deque
@@ -412,6 +413,182 @@ def perspective_owner_dist(
     t = max(0.0, min(1.0, t))
     scale = far_scale + (near_scale - far_scale) * t
     return float(base_dist_px) * scale
+
+
+# ---------------------------------------------------------------------------
+# Pitch heatmap helpers
+# ---------------------------------------------------------------------------
+
+def compute_stable_homography(
+    keypoints_list: List[np.ndarray],
+    target_vertices: np.ndarray,
+) -> Optional[np.ndarray]:
+    """
+    Compute a robust homography matrix from a collection of per-frame keypoint
+    detections and their corresponding pitch target vertices.
+
+    All valid (non-zero) source keypoints from all provided frames are pooled
+    together and passed to ``cv2.findHomography`` with RANSAC so that outlier
+    detections are automatically rejected.
+
+    Args:
+        keypoints_list: List of ``(N, 2)`` arrays of source pixel coordinates,
+            one array per sampled frame.  Entries where either coordinate is
+            ≤ 1 are treated as undetected (the pitch detection model marks
+            missing keypoints at ``(0, 0)`` or similar near-zero values) and
+            are excluded from the computation.
+        target_vertices: ``(N, 2)`` array of the corresponding pitch
+            coordinates (same ordering as the keypoint class labels).
+
+    Returns:
+        A ``(3, 3)`` homography matrix, or *None* if fewer than four valid
+        point correspondences are available across all frames.
+    """
+    import cv2  # local import – keeps module importable without OpenCV
+
+    target_vertices = np.asarray(target_vertices, dtype=np.float32)
+    src_pts: List[np.ndarray] = []
+    dst_pts: List[np.ndarray] = []
+
+    for kp_xy in keypoints_list:
+        kp_xy = np.asarray(kp_xy, dtype=np.float32)
+        if kp_xy.ndim != 2 or kp_xy.shape[1] != 2:
+            continue
+        n = min(len(kp_xy), len(target_vertices))
+        # The pitch detection model marks undetected keypoints at (0, 0) or
+        # very small pixel values (≤ 1).  Require both coordinates to be
+        # strictly greater than 1 so that these placeholder values are excluded.
+        valid = (kp_xy[:n, 0] > 1) & (kp_xy[:n, 1] > 1)
+        if not np.any(valid):
+            continue
+        src_pts.append(kp_xy[:n][valid])
+        dst_pts.append(target_vertices[:n][valid])
+
+    if not src_pts:
+        return None
+
+    all_src = np.concatenate(src_pts, axis=0)
+    all_dst = np.concatenate(dst_pts, axis=0)
+
+    if len(all_src) < 4:
+        return None
+
+    H, _ = cv2.findHomography(all_src, all_dst, cv2.RANSAC, 5.0)
+    return H  # may be None if RANSAC failed
+
+
+def transform_points_homography(
+    points: np.ndarray,
+    H: np.ndarray,
+) -> np.ndarray:
+    """
+    Apply a homography matrix *H* to an ``(N, 2)`` array of pixel coordinates
+    and return the transformed ``(N, 2)`` array in pitch space.
+
+    Args:
+        points: ``(N, 2)`` float array of source pixel coordinates.
+        H: ``(3, 3)`` homography matrix returned by
+            :func:`compute_stable_homography` or ``cv2.findHomography``.
+
+    Returns:
+        ``(N, 2)`` float array of transformed coordinates.  If *points* is
+        empty the input is returned unchanged.
+    """
+    import cv2
+
+    points = np.asarray(points, dtype=np.float32)
+    if points.size == 0:
+        return points
+    reshaped = points.reshape(-1, 1, 2)
+    transformed = cv2.perspectiveTransform(reshaped, H)
+    return transformed.reshape(-1, 2).astype(np.float32)
+
+
+def generate_pitch_heatmap(
+    pitch_x: np.ndarray,
+    pitch_y: np.ndarray,
+    pitch_length_m: float,
+    pitch_width_m: float,
+    title: str = "",
+    figsize: Tuple[int, int] = (13, 8),
+    cmap: str = "hot",
+    alpha: float = 0.65,
+    levels: int = 100,
+    thresh: float = 0.05,
+    pitch_color: str = "#22312b",
+    line_color: str = "#c7d5cc",
+) -> "plt.Figure":  # type: ignore[name-defined]
+    """
+    Draw a KDE heatmap on a top-down soccer pitch using ``mplsoccer`` and
+    ``seaborn``.
+
+    Args:
+        pitch_x: 1-D array of player X positions in pitch metres (along the
+            length axis).
+        pitch_y: 1-D array of player Y positions in pitch metres (along the
+            width axis).
+        pitch_length_m: Pitch length in metres (used for ``mplsoccer`` and
+            for clipping out-of-bounds points).
+        pitch_width_m: Pitch width in metres.
+        title: Figure title.  Empty string → no title.
+        figsize: ``(width, height)`` in inches for the figure.
+        cmap: Matplotlib colour-map name for the KDE fill.
+        alpha: Opacity of the KDE layer.
+        levels: Number of contour levels in the KDE.
+        thresh: KDE threshold below which density is not drawn.
+        pitch_color: Background colour of the pitch.
+        line_color: Colour of pitch markings.
+
+    Returns:
+        ``matplotlib.figure.Figure`` – caller is responsible for
+        ``plt.savefig`` / ``plt.show`` / ``plt.close``.
+    """
+    try:
+        from mplsoccer import Pitch  # type: ignore
+        import matplotlib.pyplot as plt  # type: ignore
+        import seaborn as sns  # type: ignore
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "mplsoccer and seaborn are required for heatmap generation. "
+            "Install them with: pip install mplsoccer seaborn"
+        ) from exc
+
+    pitch_x = np.asarray(pitch_x, dtype=float)
+    pitch_y = np.asarray(pitch_y, dtype=float)
+
+    # Clip to valid pitch area
+    mask = (
+        (pitch_x >= 0) & (pitch_x <= pitch_length_m) &
+        (pitch_y >= 0) & (pitch_y <= pitch_width_m)
+    )
+    pitch_x = pitch_x[mask]
+    pitch_y = pitch_y[mask]
+
+    pitch = Pitch(
+        pitch_type="custom",
+        pitch_length=pitch_length_m,
+        pitch_width=pitch_width_m,
+        pitch_color=pitch_color,
+        line_color=line_color,
+    )
+    fig, ax = pitch.draw(figsize=figsize)
+
+    if len(pitch_x) >= 2:
+        sns.kdeplot(
+            x=pitch_x,
+            y=pitch_y,
+            fill=True,
+            thresh=thresh,
+            levels=levels,
+            cmap=cmap,
+            alpha=alpha,
+            ax=ax,
+        )
+
+    if title:
+        ax.set_title(title, color="white", fontsize=16, pad=10)
+
+    return fig
 
 
 # ---------------------------------------------------------------------------
