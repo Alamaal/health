@@ -371,6 +371,50 @@ class PossessionTracker:
 
 
 # ---------------------------------------------------------------------------
+# Perspective-aware ownership distance helper
+# ---------------------------------------------------------------------------
+
+def perspective_owner_dist(
+    player_y: float,
+    frame_h: float,
+    base_dist_px: float,
+    near_scale: float = 1.4,
+    far_scale: float = 0.6,
+) -> float:
+    """
+    Return a perspective-corrected ball-ownership distance threshold for a
+    player at vertical position *player_y* in a frame of height *frame_h*.
+
+    For medium-high angle camera footage (typical stadium/TV broadcast), players
+    near the bottom of the frame (close to camera) appear larger and should be
+    granted a wider ownership radius.  Players near the top of the frame (far
+    side of the pitch) appear smaller and need a tighter radius.
+
+    The threshold scales linearly between *far_scale* × *base_dist_px* at
+    ``player_y == 0`` and *near_scale* × *base_dist_px* at
+    ``player_y == frame_h``.
+
+    Args:
+        player_y (float): Player's Y coordinate in the frame (pixels from top).
+        frame_h (float): Full frame height in pixels.  Must be > 0.
+        base_dist_px (float): The nominal ownership distance at mid-height.
+        near_scale (float): Multiplier applied when the player is at the very
+            bottom of the frame (closest to camera).  Defaults to 1.4.
+        far_scale (float): Multiplier applied when the player is at the very
+            top of the frame (farthest from camera).  Defaults to 0.6.
+
+    Returns:
+        float: Adjusted ownership distance in pixels.
+    """
+    if frame_h <= 0:
+        return float(base_dist_px)
+    t = float(player_y) / float(frame_h)
+    t = max(0.0, min(1.0, t))
+    scale = far_scale + (near_scale - far_scale) * t
+    return float(base_dist_px) * scale
+
+
+# ---------------------------------------------------------------------------
 # Video overlay helpers
 # ---------------------------------------------------------------------------
 
@@ -405,8 +449,8 @@ def draw_stats_overlay(
     import cv2  # local import to keep module testable without OpenCV
 
     total = max(frame_index, 1)
-    poss_0 = possession_tracker.possession_pct(0, total)
-    poss_1 = possession_tracker.possession_pct(1, total)
+    poss_0 = possession_tracker.possession_pct_normalized(0)
+    poss_1 = possession_tracker.possession_pct_normalized(1)
     passes_0 = pass_detector.get_pass_count(0)
     passes_1 = pass_detector.get_pass_count(1)
 
