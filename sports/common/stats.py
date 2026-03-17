@@ -21,14 +21,14 @@ import numpy as np
 # Pass quality filters
 DEFAULT_MIN_BALL_SPEED_PX_PER_SEC: float = 300.0   # filter dribble noise (note 2)
 DEFAULT_PASS_DEBOUNCE_SEC: float = 1.0              # ignore back-to-back passes (note 12)
-DEFAULT_PASS_MIN_DIST_PX: float = 100.0             # ignore short passes (note 13)
-DEFAULT_ID_SWITCH_GUARD_PX: float = 65.0            # same-team change < this = same player (note 11)
+DEFAULT_PASS_MIN_DIST_PX: float = 60.0              # ignore short passes (note 13)
+DEFAULT_ID_SWITCH_GUARD_PX: float = 150.0           # same-team change < this = same player (note 11)
 
 # Possession proximity weighting (note 1)
 DEFAULT_MIN_OWNER_DIST_PX: float = 140.0
 
 # Team temporal-confirmation buffer (notes 0, 8)
-DEFAULT_TEAM_VOTE_BUFFER_SIZE: int = 64
+DEFAULT_TEAM_VOTE_BUFFER_SIZE: int = 250
 DEFAULT_TEAM_VOTE_MIN_FRAMES: int = 8
 
 

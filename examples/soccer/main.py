@@ -533,8 +533,8 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
 
     ball_tracker = BallTracker(buffer_size=20)
     ball_annotator = BallAnnotator(radius=6, buffer_size=10)
-    reid = PlayerReIdentifier(max_frames_lost=300, position_tolerance_px=120)
-    vote_buffer = TeamVoteBuffer(buffer_size=64, min_votes=8)
+    reid = PlayerReIdentifier(max_frames_lost=900, position_tolerance_px=120)
+    vote_buffer = TeamVoteBuffer(buffer_size=250, min_votes=8)
     pass_detector = PassDetector(fps=fps)
     possession_tracker = PossessionTracker(max_owner_dist_px=MAX_OWNER_DIST_PX)
 

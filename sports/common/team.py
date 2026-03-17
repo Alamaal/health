@@ -213,7 +213,7 @@ class PlayerReIdentifier:
 
     Typical usage inside a per-frame loop::
 
-        reid = PlayerReIdentifier(max_frames_lost=300, position_tolerance_px=120)
+        reid = PlayerReIdentifier(max_frames_lost=900, position_tolerance_px=120)
 
         # After sv.ByteTrack.update_with_detections(detections):
         for i, (tid, xy) in enumerate(zip(tracker_ids, positions_xy)):
@@ -227,7 +227,7 @@ class PlayerReIdentifier:
 
     def __init__(
         self,
-        max_frames_lost: int = 300,
+        max_frames_lost: int = 900,
         position_tolerance_px: float = 120.0,
         embedding_similarity_threshold: float = 0.85,
     ) -> None:
@@ -237,7 +237,7 @@ class PlayerReIdentifier:
         Args:
             max_frames_lost (int): Number of processed frames a lost track is
                 retained in the gallery before being discarded.  At 30 fps this
-                equals ~10 s of video.  Defaults to 300.
+                equals ~30 s of video.  Defaults to 900.
             position_tolerance_px (float): Maximum Euclidean distance (in source
                 image pixels) between a newly-created track and a gallery entry
                 for them to be considered the same player (spatial fallback).

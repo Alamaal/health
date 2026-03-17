@@ -2,7 +2,7 @@
 Unit tests for the PlayerReIdentifier class in sports.common.team.
 
 Covers:
-- Default parameter values (max_frames_lost=300, embedding_similarity_threshold=0.85)
+- Default parameter values (max_frames_lost=900, embedding_similarity_threshold=0.85)
 - Gallery-based spatial re-identification (position fallback)
 - Embedding-based re-identification (cosine similarity matching)
 - Embedding preferred over spatial match
@@ -47,9 +47,9 @@ def _unit_vec(dim: int, index: int) -> np.ndarray:
 
 class TestDefaults:
     def test_default_max_frames_lost(self):
-        """Default max_frames_lost should be 300."""
+        """Default max_frames_lost should be 900."""
         reid = PlayerReIdentifier()
-        assert reid._max_frames_lost == 300
+        assert reid._max_frames_lost == 900
 
     def test_default_embedding_similarity_threshold(self):
         """Default embedding_similarity_threshold should be 0.85."""
