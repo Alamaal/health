@@ -8,6 +8,7 @@ Covers:
 - PossessionTracker: proximity-weighted possession counting
 - PassEvent: dataclass record of a single pass
 - draw_stats_overlay / draw_pass_label: video overlay helpers
+- compute_stable_homography / transform_points_homography: pitch heatmap helpers
 """
 
 import numpy as np
@@ -18,9 +19,11 @@ from sports.common.stats import (
     PassEvent,
     PossessionTracker,
     TeamVoteBuffer,
+    compute_stable_homography,
     draw_pass_label,
     draw_stats_overlay,
     perspective_owner_dist,
+    transform_points_homography,
 )
 
 
@@ -544,3 +547,88 @@ class TestOverlayHelpers:
         ev = PassEvent(team_id=0, time_sec=3.5, from_player_id=1, to_player_id=2)
         draw_pass_label(frame, ev, np.array([320.0, 240.0]))
         assert frame.sum() > 0
+
+
+# ---------------------------------------------------------------------------
+# compute_stable_homography & transform_points_homography
+# ---------------------------------------------------------------------------
+
+class TestPitchHomographyHelpers:
+    """Tests for the pitch heatmap homography helpers."""
+
+    # A minimal set of four coplanar source ↔ target point pairs that span a
+    # region large enough for findHomography to succeed.
+    _SRC = np.array([
+        [100.0, 100.0],
+        [900.0, 100.0],
+        [900.0, 600.0],
+        [100.0, 600.0],
+    ], dtype=np.float32)
+
+    _DST = np.array([
+        [0.0, 0.0],
+        [105.0, 0.0],
+        [105.0, 68.0],
+        [0.0, 68.0],
+    ], dtype=np.float32)
+
+    def test_homography_from_single_frame(self):
+        """compute_stable_homography returns a (3,3) matrix for one frame."""
+        H = compute_stable_homography([self._SRC], self._DST)
+        assert H is not None
+        assert H.shape == (3, 3)
+
+    def test_homography_from_multiple_frames(self):
+        """compute_stable_homography pools keypoints from multiple frames."""
+        H = compute_stable_homography([self._SRC, self._SRC], self._DST)
+        assert H is not None
+        assert H.shape == (3, 3)
+
+    def test_homography_none_when_too_few_points(self):
+        """Returns None when fewer than 4 valid source points are available."""
+        src_few = np.array([[100.0, 100.0], [900.0, 100.0]], dtype=np.float32)
+        H = compute_stable_homography([src_few], self._DST[:2])
+        assert H is None
+
+    def test_zero_keypoints_filtered_out(self):
+        """Points at (0, 0) or (1, 1) are treated as undetected and skipped."""
+        src_with_zeros = np.array([
+            [0.0, 0.0],   # undetected — filtered out
+            [1.0, 1.0],   # undetected — filtered out
+            [100.0, 100.0],
+            [900.0, 100.0],
+            [900.0, 600.0],
+            [100.0, 600.0],
+        ], dtype=np.float32)
+        dst_with_padding = np.vstack([
+            np.array([[0.0, 0.0], [0.0, 0.0]], dtype=np.float32),
+            self._DST,
+        ])
+        H = compute_stable_homography([src_with_zeros], dst_with_padding)
+        assert H is not None
+
+    def test_transform_matches_expected(self):
+        """transform_points_homography maps source corners to target corners."""
+        H = compute_stable_homography([self._SRC], self._DST)
+        assert H is not None
+        transformed = transform_points_homography(self._SRC, H)
+        assert transformed.shape == (4, 2)
+        np.testing.assert_allclose(transformed, self._DST, atol=1.0)
+
+    def test_transform_empty_input(self):
+        """transform_points_homography handles an empty input array gracefully."""
+        H = compute_stable_homography([self._SRC], self._DST)
+        assert H is not None
+        empty = np.empty((0, 2), dtype=np.float32)
+        result = transform_points_homography(empty, H)
+        assert result.shape == (0, 2)
+
+    def test_homography_empty_keypoints_list(self):
+        """compute_stable_homography returns None for an empty keypoints list."""
+        assert compute_stable_homography([], self._DST) is None
+
+    def test_homography_ignores_bad_frame_shape(self):
+        """Frames with wrong array shapes are skipped without raising."""
+        bad_frame = np.array([1, 2, 3], dtype=np.float32)  # 1-D, wrong shape
+        H = compute_stable_homography([bad_frame, self._SRC], self._DST)
+        assert H is not None  # falls back to the valid frame
