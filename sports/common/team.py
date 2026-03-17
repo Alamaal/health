@@ -15,6 +15,8 @@ except ImportError:  # pragma: no cover
 
 V = TypeVar("V")
 SIGLIP_MODEL_PATH = 'google/siglip-base-patch16-224'
+# Small value added to denominators to prevent division by zero.
+_EPS: float = 1e-9
 
 def create_batches(sequence: Iterable[V], batch_size: int) -> Generator[List[V], None, None]:
     batch_size = max(batch_size, 1)
@@ -131,6 +133,55 @@ class TeamClassifier:
         data = self.extract_features(crops, verbose=False)
         projections = self.reducer.transform(data)
         return self.cluster_model.predict(projections)
+
+    def predict_with_confidence(
+        self, crops: List[np.ndarray]
+    ) -> tuple:
+        """
+        Predict team IDs and return a per-sample confidence score.
+
+        Confidence is derived from the KMeans centroid distances.  For each
+        sample the score is::
+
+            confidence_i = d_other / (d_winner + d_other)
+
+        where *d_winner* is the Euclidean distance to the assigned cluster
+        centre and *d_other* is the distance to the other cluster centre.
+
+        This maps naturally to the intuitive scale:
+
+        * ``1.0`` — player is exactly on the winning centroid (perfectly
+          certain).
+        * ``0.5`` — player is equidistant from both centroids (maximally
+          ambiguous).
+
+        Args:
+            crops (List[np.ndarray]): List of player crop images (BGR).
+
+        Returns:
+            tuple: A ``(team_ids, confidences)`` pair where
+
+                * ``team_ids`` is an int ``np.ndarray`` of shape ``(N,)``
+                  containing 0 or 1 for each crop.
+                * ``confidences`` is a float ``np.ndarray`` of shape ``(N,)``
+                  with values in ``[0.5, 1.0]``.
+
+                Both arrays are empty (shape ``(0,)``) when *crops* is empty.
+        """
+        if len(crops) == 0:
+            return np.array([], dtype=int), np.array([], dtype=float)
+
+        data = self.extract_features(crops, verbose=False)
+        projections = self.reducer.transform(data)
+        # distances shape: (N, 2) — distance to each of the 2 cluster centres
+        distances = self.cluster_model.transform(projections)
+        team_ids = np.argmin(distances, axis=1).astype(int)
+
+        d_winner = distances[np.arange(len(team_ids)), team_ids]
+        d_other = distances[np.arange(len(team_ids)), 1 - team_ids]
+        confidences = d_other / (d_winner + d_other + _EPS)
+
+        return team_ids, confidences
 
 
 class PlayerReIdentifier:
@@ -449,3 +500,100 @@ class PlayerReIdentifier:
         if existing is None:
             return new.copy()
         return (existing + new) / 2.0
+
+
+# ---------------------------------------------------------------------------
+# Team-cache helper utilities
+# ---------------------------------------------------------------------------
+
+def _safe_tracker_id(value) -> Optional[int]:
+    """
+    Safely convert a tracker ID value to int, returning None for NaN or invalid.
+
+    Args:
+        value: The tracker ID value to convert (may be float NaN from ByteTrack).
+
+    Returns:
+        Optional[int]: Integer tracker ID, or *None* if the value is NaN,
+        *None*, or otherwise unconvertible.
+    """
+    if value is None:
+        return None
+    try:
+        if np.isnan(value):
+            return None
+    except Exception:
+        pass
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def resolve_players_team_with_cache(
+    team_classifier: "TeamClassifier",
+    crops: List[np.ndarray],
+    tracker_ids,
+    team_cache: Dict[int, int],
+    confidence_threshold: float = 0.65,
+) -> np.ndarray:
+    """
+    Predict team IDs for player crops, using a per-tracker-ID cache to skip
+    redundant inference on players already classified with high confidence.
+
+    A prediction is only cached when its confidence score (from
+    :meth:`TeamClassifier.predict_with_confidence`) is at or above
+    *confidence_threshold*.  Low-confidence predictions are still *returned*
+    but not written to the cache, so the player is re-evaluated on the next
+    frame.  This prevents a single uncertain crop (e.g. motion blur, heavy
+    occlusion) from permanently locking in the wrong team label and ensures
+    the downstream :class:`~sports.common.stats.TeamVoteBuffer` always
+    receives the best available prediction.
+
+    Args:
+        team_classifier (TeamClassifier): Fitted team classifier.
+        crops (List[np.ndarray]): Cropped player images (BGR, arbitrary size).
+        tracker_ids: Array-like of tracker IDs for each crop (may contain NaN
+            values from ByteTrack when a detection has no assigned ID).
+        team_cache (Dict[int, int]): Mutable mapping from tracker ID to team
+            ID.  High-confidence predictions are written here; low-confidence
+            predictions are not.
+        confidence_threshold (float): Minimum confidence in ``[0.5, 1.0]``
+            required to cache a prediction.  Defaults to 0.65.
+
+    Returns:
+        np.ndarray: Integer array of shape ``(N,)`` containing team IDs
+        (0 or 1) for each crop.
+    """
+    if len(crops) == 0:
+        return np.array([], dtype=int)
+
+    team_ids = np.full(len(crops), -1, dtype=int)
+    to_classify_idx: List[int] = []
+    to_classify_crops: List[np.ndarray] = []
+    to_classify_tids: List[Optional[int]] = []
+
+    for i in range(len(crops)):
+        tid = _safe_tracker_id(tracker_ids[i]) if tracker_ids is not None else None
+        if tid is not None and tid in team_cache:
+            team_ids[i] = int(team_cache[tid])
+        else:
+            to_classify_idx.append(i)
+            to_classify_crops.append(crops[i])
+            to_classify_tids.append(tid)
+
+    if to_classify_crops:
+        predicted, confidences = team_classifier.predict_with_confidence(
+            to_classify_crops
+        )
+        predicted = predicted.astype(int)
+        for idx, pred_team, conf, tid in zip(
+            to_classify_idx, predicted, confidences, to_classify_tids
+        ):
+            team_ids[idx] = int(pred_team)
+            # Only cache predictions we are confident about; uncertain crops
+            # will be re-classified next frame.
+            if tid is not None and team_ids[idx] in (0, 1) and conf >= confidence_threshold:
+                team_cache[tid] = int(team_ids[idx])
+
+    return team_ids
