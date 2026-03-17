@@ -570,7 +570,7 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
 
     ball_tracker = BallTracker(buffer_size=20)
     ball_annotator = BallAnnotator(radius=6, buffer_size=10)
-    reid = PlayerReIdentifier(max_frames_lost=90, position_tolerance_px=120)
+    reid = PlayerReIdentifier(max_frames_lost=300, position_tolerance_px=120)
     vote_buffer = TeamVoteBuffer(buffer_size=64, min_votes=8)
     pass_detector = PassDetector(fps=fps)
     possession_tracker = PossessionTracker(max_owner_dist_px=MAX_OWNER_DIST_PX)
@@ -623,6 +623,35 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
         all_field_xy = all_field_players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER) \
             if len(all_field_players) > 0 else np.empty((0, 2))
 
+        # Extract SigLIP embeddings for players/goalkeepers that are new to the
+        # re-identifier gallery.  Embeddings are only needed for brand-new
+        # tracker IDs (i.e. first appearance or re-appearance after loss) so
+        # that we can compare against gallery entries for appearance-based
+        # re-identification.  Already-tracked players reuse stored embeddings.
+        all_field_crops = get_crops(frame, all_field_players) \
+            if len(all_field_players) > 0 else []
+        new_embed_indices = [
+            i for i in range(len(all_field_players))
+            if _safe_tracker_id(
+                all_field_players.tracker_id[i]
+                if all_field_players.tracker_id is not None else None
+            ) is not None
+            and not reid.has_tracker_id(
+                _safe_tracker_id(
+                    all_field_players.tracker_id[i]
+                    if all_field_players.tracker_id is not None else None
+                )
+            )
+        ]
+        field_embeddings: List[Optional[np.ndarray]] = [None] * len(all_field_players)
+        if new_embed_indices and all_field_crops:
+            new_crops_for_reid = [all_field_crops[i] for i in new_embed_indices]
+            reid_embs = team_classifier.extract_features(
+                new_crops_for_reid, verbose=False
+            )
+            for j, idx in enumerate(new_embed_indices):
+                field_embeddings[idx] = reid_embs[j]
+
         canonical_ids = []
         stable_team_ids = []
         for i in range(len(all_field_players)):
@@ -634,7 +663,11 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
                 canonical_ids.append(None)
                 stable_team_ids.append(int(all_field_team_ids[i]))
                 continue
-            cid = reid.get_stable_id(tid, all_field_xy[i], team_id=int(all_field_team_ids[i]))
+            cid = reid.get_stable_id(
+                tid, all_field_xy[i],
+                team_id=int(all_field_team_ids[i]),
+                embedding=field_embeddings[i],
+            )
             canonical_ids.append(cid)
             stable_team_ids.append(vote_buffer.update(cid, int(all_field_team_ids[i])))
         reid.end_frame()
