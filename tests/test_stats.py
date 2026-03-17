@@ -20,6 +20,7 @@ from sports.common.stats import (
     TeamVoteBuffer,
     draw_pass_label,
     draw_stats_overlay,
+    perspective_owner_dist,
 )
 
 
@@ -327,6 +328,33 @@ class TestPossessionTracker:
         pt.update(0, np.array([0.0, 0.0]), np.array([0.0, 0.0]))
         assert pt.possession_pct(0, total_frames=0) == 0.0
 
+    def test_possession_pct_normalized_sums_to_100(self):
+        """possession_pct_normalized sums to exactly 100% across two teams."""
+        pt = PossessionTracker(max_owner_dist_px=80.0)
+        origin = np.array([0.0, 0.0])
+        for _ in range(3):
+            pt.update(0, origin, origin)
+        for _ in range(7):
+            pt.update(1, origin, origin)
+        total = pt.possession_pct_normalized(0) + pt.possession_pct_normalized(1)
+        assert abs(total - 100.0) < 1e-9
+
+    def test_possession_pct_normalized_proportions(self):
+        """possession_pct_normalized reflects the correct share per team."""
+        pt = PossessionTracker(max_owner_dist_px=80.0)
+        origin = np.array([0.0, 0.0])
+        for _ in range(1):
+            pt.update(0, origin, origin)
+        for _ in range(3):
+            pt.update(1, origin, origin)
+        assert abs(pt.possession_pct_normalized(0) - 25.0) < 1e-9
+        assert abs(pt.possession_pct_normalized(1) - 75.0) < 1e-9
+
+    def test_possession_pct_normalized_no_data(self):
+        """possession_pct_normalized returns 0.0 when nothing has been recorded."""
+        pt = PossessionTracker()
+        assert pt.possession_pct_normalized(0) == 0.0
+
     def test_reset_clears_data(self):
         """reset() zeroes all accumulated possession."""
         pt = PossessionTracker()
@@ -334,6 +362,48 @@ class TestPossessionTracker:
         pt.reset()
         assert pt.weighted_frames(0) == 0.0
         assert pt.possession_pct(0, total_frames=10) == 0.0
+
+
+
+# ---------------------------------------------------------------------------
+# perspective_owner_dist
+# ---------------------------------------------------------------------------
+
+class TestPerspectiveOwnerDist:
+    """perspective_owner_dist scales ownership radius with vertical position."""
+
+    def test_top_of_frame_returns_far_scale(self):
+        """Player at y=0 (top) should return far_scale * base."""
+        result = perspective_owner_dist(player_y=0, frame_h=1080, base_dist_px=120,
+                                       near_scale=1.4, far_scale=0.6)
+        assert abs(result - 120 * 0.6) < 1e-9
+
+    def test_bottom_of_frame_returns_near_scale(self):
+        """Player at y=frame_h (bottom) should return near_scale * base."""
+        result = perspective_owner_dist(player_y=1080, frame_h=1080, base_dist_px=120,
+                                       near_scale=1.4, far_scale=0.6)
+        assert abs(result - 120 * 1.4) < 1e-9
+
+    def test_mid_frame_is_average(self):
+        """Player at mid-height should return average of near and far scales."""
+        result = perspective_owner_dist(player_y=540, frame_h=1080, base_dist_px=100,
+                                       near_scale=1.4, far_scale=0.6)
+        expected = 100 * (0.6 + (1.4 - 0.6) * 0.5)
+        assert abs(result - expected) < 1e-9
+
+    def test_zero_frame_height_returns_base(self):
+        """Zero frame height should not raise and should return the base distance."""
+        result = perspective_owner_dist(player_y=500, frame_h=0, base_dist_px=120)
+        assert result == 120.0
+
+    def test_out_of_bounds_y_is_clamped(self):
+        """y > frame_h is clamped to the near-side maximum."""
+        result_high = perspective_owner_dist(player_y=2000, frame_h=1080, base_dist_px=100,
+                                             near_scale=1.4, far_scale=0.6)
+        result_low = perspective_owner_dist(player_y=-100, frame_h=1080, base_dist_px=100,
+                                            near_scale=1.4, far_scale=0.6)
+        assert abs(result_high - 100 * 1.4) < 1e-9
+        assert abs(result_low - 100 * 0.6) < 1e-9
 
 
 # ---------------------------------------------------------------------------
