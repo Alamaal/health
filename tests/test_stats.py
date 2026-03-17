@@ -327,6 +327,33 @@ class TestPossessionTracker:
         pt.update(0, np.array([0.0, 0.0]), np.array([0.0, 0.0]))
         assert pt.possession_pct(0, total_frames=0) == 0.0
 
+    def test_possession_pct_normalized_sums_to_100(self):
+        """possession_pct_normalized sums to exactly 100% across two teams."""
+        pt = PossessionTracker(max_owner_dist_px=80.0)
+        origin = np.array([0.0, 0.0])
+        for _ in range(3):
+            pt.update(0, origin, origin)
+        for _ in range(7):
+            pt.update(1, origin, origin)
+        total = pt.possession_pct_normalized(0) + pt.possession_pct_normalized(1)
+        assert abs(total - 100.0) < 1e-9
+
+    def test_possession_pct_normalized_proportions(self):
+        """possession_pct_normalized reflects the correct share per team."""
+        pt = PossessionTracker(max_owner_dist_px=80.0)
+        origin = np.array([0.0, 0.0])
+        for _ in range(1):
+            pt.update(0, origin, origin)
+        for _ in range(3):
+            pt.update(1, origin, origin)
+        assert abs(pt.possession_pct_normalized(0) - 25.0) < 1e-9
+        assert abs(pt.possession_pct_normalized(1) - 75.0) < 1e-9
+
+    def test_possession_pct_normalized_no_data(self):
+        """possession_pct_normalized returns 0.0 when nothing has been recorded."""
+        pt = PossessionTracker()
+        assert pt.possession_pct_normalized(0) == 0.0
+
     def test_reset_clears_data(self):
         """reset() zeroes all accumulated possession."""
         pt = PossessionTracker()

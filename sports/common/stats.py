@@ -347,6 +347,24 @@ class PossessionTracker:
             return 0.0
         return 100.0 * self._possession.get(team_id, 0.0) / float(total_frames)
 
+    def possession_pct_normalized(self, team_id: int) -> float:
+        """
+        Return possession as a percentage of total *known* possession frames
+        (i.e. frames where any team had the ball), so that the values for all
+        teams sum to exactly 100 % — matching the TV-style display.
+
+        Args:
+            team_id (int): Team to query.
+
+        Returns:
+            float: Percentage in [0, 100].  Returns 0.0 when no possession has
+            been recorded yet.
+        """
+        total = sum(self._possession.values())
+        if total <= 0:
+            return 0.0
+        return 100.0 * self._possession.get(team_id, 0.0) / total
+
     def reset(self) -> None:
         """Clear all accumulated possession data."""
         self._possession.clear()
