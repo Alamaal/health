@@ -473,7 +473,7 @@ class PlayerReIdentifier:
         b = b.flatten()
         norm_a = float(np.linalg.norm(a))
         norm_b = float(np.linalg.norm(b))
-        if norm_a < 1e-8 or norm_b < 1e-8:
+        if norm_a < _EPS or norm_b < _EPS:
             return 0.0
         return float(np.dot(a, b) / (norm_a * norm_b))
 
@@ -483,7 +483,11 @@ class PlayerReIdentifier:
         new: Optional[np.ndarray],
     ) -> Optional[np.ndarray]:
         """
-        Update a stored gallery embedding using a running average.
+        Update a stored gallery embedding using an exponential moving average.
+
+        An EMA with ``alpha=0.15`` (15 % new, 85 % old) lets the gallery
+        representation converge over many re-appearances rather than
+        oscillating between the last two observations.
 
         Args:
             existing (Optional[np.ndarray]): The currently stored embedding,
@@ -499,7 +503,9 @@ class PlayerReIdentifier:
             return existing
         if existing is None:
             return new.copy()
-        return (existing + new) / 2.0
+        # EMA: weight recent updates lightly so the gallery stabilises over time.
+        _EMBED_EMA_ALPHA = 0.15
+        return existing * (1.0 - _EMBED_EMA_ALPHA) + new * _EMBED_EMA_ALPHA
 
 
 # ---------------------------------------------------------------------------

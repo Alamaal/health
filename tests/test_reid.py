@@ -135,7 +135,9 @@ class TestUpdateEmbedding:
         existing = np.array([0.0, 0.0])
         new = np.array([2.0, 4.0])
         result = PlayerReIdentifier._update_embedding(existing, new)
-        np.testing.assert_array_almost_equal(result, np.array([1.0, 2.0]))
+        # EMA: 0.85 * existing + 0.15 * new
+        expected = 0.85 * existing + 0.15 * new
+        np.testing.assert_array_almost_equal(result, expected)
 
 
 # ---------------------------------------------------------------------------
@@ -357,8 +359,9 @@ class TestGalleryEmbeddingUpdate:
         reid.end_frame()
 
         stored = reid._gallery[cid]["embedding"]
-        # Running average: (emb1 + emb2) / 2 = [0.5, 0.5]
-        np.testing.assert_array_almost_equal(stored, np.array([0.5, 0.5]))
+        # EMA: 0.85 * emb1 + 0.15 * emb2
+        expected = 0.85 * emb1 + 0.15 * emb2
+        np.testing.assert_array_almost_equal(stored, expected)
 
     def test_embedding_preserved_when_update_is_none(self):
         """Gallery embedding is preserved when no new embedding is provided on revisit."""
