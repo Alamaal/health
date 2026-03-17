@@ -1,3 +1,4 @@
+from collections import Counter
 from typing import Dict, Generator, Iterable, List, Optional, TypeVar
 
 import numpy as np
@@ -534,6 +535,70 @@ def _safe_tracker_id(value) -> Optional[int]:
         return int(value)
     except Exception:
         return None
+
+
+def majority_vote_team_reassignment(
+    player_team_history: Dict[int, List[int]],
+    majority_threshold: float = 0.8,
+) -> Dict[int, int]:
+    """
+    Post-process player team assignments using majority-vote reinforcement.
+
+    After tracking is complete, some canonical player IDs may have been
+    misclassified into the wrong team on individual frames due to ID
+    fragmentation or colour-model bias.  This function collects the full
+    per-frame team-classification history for each canonical ID and returns
+    a *corrected* mapping: any player whose dominant team accounts for at
+    least *majority_threshold* fraction of their recorded votes is included
+    in the result with that team.  Players whose history does not reach the
+    threshold are omitted, meaning callers should keep their original
+    assignment for those players.
+
+    Typical usage::
+
+        # Accumulate raw per-frame predictions during tracking:
+        history: Dict[int, List[int]] = defaultdict(list)
+        for frame in frames:
+            for canonical_id, raw_team in zip(canonical_ids, raw_teams):
+                history[canonical_id].append(raw_team)
+
+        # Post-process after the full video has been processed:
+        corrected = majority_vote_team_reassignment(history)
+
+        # Re-map events (only players in corrected dict are changed):
+        for event in events:
+            if event["player_id"] in corrected:
+                event["team"] = corrected[event["player_id"]]
+
+    Args:
+        player_team_history (Dict[int, List[int]]): Mapping from canonical
+            player ID to a list of per-frame raw team-ID predictions (each
+            element must be 0 or 1).  Players with an empty history are
+            omitted from the result.
+        majority_threshold (float): Minimum fraction of votes that the
+            dominant team must receive for the player to be included in the
+            corrected result.  Must be in ``(0.5, 1.0]``.  Defaults to 0.8
+            (80 %).  Players whose dominant team receives fewer than this
+            fraction of votes are omitted — callers keep their original
+            assignment.
+
+    Returns:
+        Dict[int, int]: Mapping from canonical player ID to corrected team
+        ID (0 or 1).  Only players whose dominant team reaches
+        *majority_threshold* are included.
+    """
+    majority_threshold = float(majority_threshold)
+    result: Dict[int, int] = {}
+    for canonical_id, history in player_team_history.items():
+        valid = [t for t in history if t in (0, 1)]
+        if not valid:
+            continue
+        total = len(valid)
+        counts = Counter(valid)
+        best_team, best_count = counts.most_common(1)[0]
+        if best_count / total >= majority_threshold:
+            result[canonical_id] = best_team
+    return result
 
 
 def resolve_players_team_with_cache(

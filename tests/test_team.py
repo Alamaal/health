@@ -439,3 +439,104 @@ class TestResolvePlayersTeamWithCacheCachingBehaviour:
         # tracker 30 (conf 0.8 ≥ 0.65) → cached
         assert 30 in cache
 
+
+# ---------------------------------------------------------------------------
+# majority_vote_team_reassignment
+# ---------------------------------------------------------------------------
+
+class TestMajorityVoteTeamReassignment:
+    """majority_vote_team_reassignment post-processes player team assignments."""
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        try:
+            from sports.common.team import majority_vote_team_reassignment
+            self.fn = majority_vote_team_reassignment
+        except ImportError:
+            pytest.skip("sports.common.team unavailable")
+
+    def test_clear_majority_team0(self):
+        """When >80 % of votes are team 0, the player is assigned team 0."""
+        history = {1: [0, 0, 0, 0, 0, 0, 0, 0, 1, 1]}  # 80 % team 0
+        result = self.fn(history)
+        assert result[1] == 0
+
+    def test_clear_majority_team1(self):
+        """When >80 % of votes are team 1, the player is assigned team 1."""
+        history = {2: [1] * 9 + [0]}  # 90 % team 1
+        result = self.fn(history)
+        assert result[2] == 1
+
+    def test_below_threshold_uses_simple_majority(self):
+        """When no team reaches the threshold, the player is omitted from the result."""
+        history = {3: [0, 0, 0, 1, 1]}  # 60 % team 0 (below 80 %)
+        result = self.fn(history)
+        assert 3 not in result  # below threshold → excluded; caller keeps original
+
+    def test_custom_threshold(self):
+        """A custom threshold is respected: players meeting it are included."""
+        history = {4: [0, 0, 0, 1, 1]}  # 60 % team 0
+        # With threshold=0.6 exactly, team 0 should meet the threshold
+        result = self.fn(history, majority_threshold=0.6)
+        assert result[4] == 0
+
+    def test_custom_threshold_excludes_below(self):
+        """Players below a custom threshold are excluded from the result."""
+        history = {4: [0, 0, 0, 1, 1]}  # 60 % team 0
+        # With threshold=0.7, team 0 does NOT meet the threshold
+        result = self.fn(history, majority_threshold=0.7)
+        assert 4 not in result
+
+    def test_empty_history_omitted(self):
+        """Players with no valid votes are omitted from the result."""
+        history = {5: []}
+        result = self.fn(history)
+        assert 5 not in result
+
+    def test_invalid_votes_ignored(self):
+        """Only 0 and 1 are valid votes; other values are ignored."""
+        history = {6: [-1, -1, 0, 0, 0]}  # 3 valid votes, all team 0
+        result = self.fn(history)
+        assert result[6] == 0
+
+    def test_all_invalid_votes_omitted(self):
+        """A player with only invalid votes is omitted."""
+        history = {7: [-1, 2, 99]}
+        result = self.fn(history)
+        assert 7 not in result
+
+    def test_multiple_players_independent(self):
+        """Each player is processed independently."""
+        history = {
+            10: [0] * 10,           # 100 % team 0 → included
+            11: [1] * 10,           # 100 % team 1 → included
+            12: [0, 0, 0, 1, 1],    # 60 % team 0 (below 80 %) → excluded
+        }
+        result = self.fn(history)
+        assert result[10] == 0
+        assert result[11] == 1
+        assert 12 not in result  # below threshold → excluded
+
+    def test_corrects_misclassified_player(self):
+        """Simulates a player mis-assigned to team 0 due to color bias."""
+        # 85 % team 1, but the player was recorded as team 0 in a few frames
+        history = {99: [1] * 17 + [0] * 3}
+        result = self.fn(history)
+        assert result[99] == 1
+
+    def test_returns_dict(self):
+        """The function always returns a dict."""
+        result = self.fn({})
+        assert isinstance(result, dict)
+        assert len(result) == 0
+
+    def test_source_function_exists(self):
+        """majority_vote_team_reassignment must be defined in team.py."""
+        import ast
+        with open(_TEAM_PY) as f:
+            source = f.read()
+        tree = ast.parse(source)
+        fn_names = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+        assert "majority_vote_team_reassignment" in fn_names
+
+
