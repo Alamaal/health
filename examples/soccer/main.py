@@ -12,7 +12,11 @@ from ultralytics import YOLO
 
 from sports.annotators.soccer import draw_pitch, draw_points_on_pitch
 from sports.common.ball import BallTracker, BallAnnotator
-from sports.common.team import TeamClassifier, PlayerReIdentifier
+from sports.common.team import (
+    TeamClassifier,
+    PlayerReIdentifier,
+    resolve_players_team_with_cache as _resolve_players_team_with_cache,
+)
 from sports.common.stats import (
     PassDetector,
     PossessionTracker,
@@ -155,50 +159,9 @@ def _safe_tracker_id(value) -> Optional[int]:
         return None
 
 
-def _resolve_players_team_with_cache(
-    team_classifier: TeamClassifier,
-    crops: List[np.ndarray],
-    tracker_ids,
-    team_cache: Dict[int, int],
-) -> np.ndarray:
-    """
-    Predict team IDs for player crops, using a cache keyed by tracker ID to avoid
-    redundant inference on already-classified players.
-
-    Args:
-        team_classifier (TeamClassifier): Fitted team classifier.
-        crops (List[np.ndarray]): Cropped images of detected players.
-        tracker_ids: Array of tracker IDs corresponding to each crop (may contain NaN).
-        team_cache (Dict[int, int]): Mutable cache mapping tracker ID to team ID.
-
-    Returns:
-        np.ndarray: Integer array of team IDs (0 or 1) for each crop.
-    """
-    if len(crops) == 0:
-        return np.array([], dtype=int)
-
-    team_ids = np.full(len(crops), -1, dtype=int)
-    to_classify_idx = []
-    to_classify_crops = []
-    to_classify_tids = []
-
-    for i in range(len(crops)):
-        tid = _safe_tracker_id(tracker_ids[i]) if tracker_ids is not None else None
-        if tid is not None and tid in team_cache:
-            team_ids[i] = int(team_cache[tid])
-        else:
-            to_classify_idx.append(i)
-            to_classify_crops.append(crops[i])
-            to_classify_tids.append(tid)
-
-    if len(to_classify_crops) > 0:
-        predicted = team_classifier.predict(to_classify_crops).astype(int)
-        for idx, pred_team, tid in zip(to_classify_idx, predicted, to_classify_tids):
-            team_ids[idx] = int(pred_team)
-            if tid is not None and team_ids[idx] in (0, 1):
-                team_cache[tid] = int(team_ids[idx])
-
-    return team_ids
+# _resolve_players_team_with_cache is imported from sports.common.team as
+# resolve_players_team_with_cache and re-exported here under the private name
+# so all existing call sites inside this module continue to work unchanged.
 
 
 def resolve_goalkeepers_team_id(
@@ -570,7 +533,7 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
 
     ball_tracker = BallTracker(buffer_size=20)
     ball_annotator = BallAnnotator(radius=6, buffer_size=10)
-    reid = PlayerReIdentifier(max_frames_lost=90, position_tolerance_px=120)
+    reid = PlayerReIdentifier(max_frames_lost=300, position_tolerance_px=120)
     vote_buffer = TeamVoteBuffer(buffer_size=64, min_votes=8)
     pass_detector = PassDetector(fps=fps)
     possession_tracker = PossessionTracker(max_owner_dist_px=MAX_OWNER_DIST_PX)
@@ -623,6 +586,31 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
         all_field_xy = all_field_players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER) \
             if len(all_field_players) > 0 else np.empty((0, 2))
 
+        # Extract SigLIP embeddings for players/goalkeepers that are new to the
+        # re-identifier gallery.  Embeddings are only needed for brand-new
+        # tracker IDs (i.e. first appearance or re-appearance after loss) so
+        # that we can compare against gallery entries for appearance-based
+        # re-identification.  Already-tracked players reuse stored embeddings.
+        all_field_crops = get_crops(frame, all_field_players) \
+            if len(all_field_players) > 0 else []
+        new_embed_indices = []
+        for i in range(len(all_field_players)):
+            raw_tid = (
+                all_field_players.tracker_id[i]
+                if all_field_players.tracker_id is not None else None
+            )
+            tid_int = _safe_tracker_id(raw_tid)
+            if tid_int is not None and not reid.has_tracker_id(tid_int):
+                new_embed_indices.append(i)
+        field_embeddings: List[Optional[np.ndarray]] = [None] * len(all_field_players)
+        if new_embed_indices and all_field_crops:
+            new_crops_for_reid = [all_field_crops[i] for i in new_embed_indices]
+            reid_embs = team_classifier.extract_features(
+                new_crops_for_reid, verbose=False
+            )
+            for j, idx in enumerate(new_embed_indices):
+                field_embeddings[idx] = reid_embs[j]
+
         canonical_ids = []
         stable_team_ids = []
         for i in range(len(all_field_players)):
@@ -634,7 +622,11 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
                 canonical_ids.append(None)
                 stable_team_ids.append(int(all_field_team_ids[i]))
                 continue
-            cid = reid.get_stable_id(tid, all_field_xy[i], team_id=int(all_field_team_ids[i]))
+            cid = reid.get_stable_id(
+                tid, all_field_xy[i],
+                team_id=int(all_field_team_ids[i]),
+                embedding=field_embeddings[i],
+            )
             canonical_ids.append(cid)
             stable_team_ids.append(vote_buffer.update(cid, int(all_field_team_ids[i])))
         reid.end_frame()
