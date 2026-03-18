@@ -11,7 +11,7 @@ from tqdm import tqdm
 from ultralytics import YOLO
 
 from sports.annotators.soccer import draw_pitch, draw_points_on_pitch
-from sports.common.ball import BallTracker, BallAnnotator
+from sports.common.ball import BallTracker, BallAnnotator, BallSmoother
 from sports.common.team import (
     TeamClassifier,
     PlayerReIdentifier,
@@ -532,8 +532,13 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
     )
 
     ball_tracker = BallTracker(buffer_size=20)
+    ball_smoother = BallSmoother(window=5, noise_floor_px=5.0, max_velocity_px_per_frame=60.0)
     ball_annotator = BallAnnotator(radius=6, buffer_size=10)
-    reid = PlayerReIdentifier(max_frames_lost=900, position_tolerance_px=120)
+    reid = PlayerReIdentifier(
+        max_frames_lost=900,
+        position_tolerance_px=150,
+        min_consecutive_frames=10,
+    )
     vote_buffer = TeamVoteBuffer(buffer_size=250, min_votes=8)
     pass_detector = PassDetector(fps=fps)
     possession_tracker = PossessionTracker(max_owner_dist_px=MAX_OWNER_DIST_PX)
@@ -577,7 +582,10 @@ def run_radar(source_video_path: str, device: str, stride: int = STRIDE) -> Iter
         ball_dets = ball_tracker.update(ball_dets)
         ball_xy: Optional[np.ndarray] = None
         if len(ball_dets) > 0:
-            ball_xy = ball_dets.get_anchors_coordinates(sv.Position.CENTER)[0]
+            raw_ball_xy = ball_dets.get_anchors_coordinates(sv.Position.CENTER)[0]
+            ball_xy = ball_smoother.update(raw_ball_xy)
+        else:
+            ball_xy = ball_smoother.update(None)
 
         # --- Stable IDs (re-identification) & team vote buffering ---
         all_field_players = sv.Detections.merge([players, goalkeepers])
