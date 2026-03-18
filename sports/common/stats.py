@@ -694,9 +694,39 @@ def draw_pass_label(
 # Pitch analytics helpers
 # ---------------------------------------------------------------------------
 
+def _progression_from_delta(
+    delta: np.ndarray,
+    play_dir: float = 1.0,
+    noise_floor: float = 0.0,
+) -> Tuple[float, float]:
+    """
+    Compute forward and backward totals from a signed delta array.
+
+    Args:
+        delta: 1-D float array of signed displacements (already oriented so
+            that positive values are in the raw coordinate direction).
+        play_dir: Scalar multiplier applied to *delta* before splitting.
+            Use ``+1`` or ``-1`` to orient the attack direction.
+        noise_floor: Absolute displacement threshold below which steps are
+            discarded as noise.  ``0.0`` (default) disables filtering.
+
+    Returns:
+        ``(forward, backward)`` where both values are non-negative.
+    """
+    d = np.asarray(delta, dtype=float).ravel() * float(play_dir)
+    if float(noise_floor) > 0.0:
+        d = d[np.abs(d) > float(noise_floor)]
+    if len(d) == 0:
+        return 0.0, 0.0
+    fwd = float(d[d > 0].sum())
+    bwd = float(np.abs(d[d < 0]).sum())
+    return fwd, bwd
+
+
 def ball_progression(
     pitch_x: np.ndarray,
     play_direction: int = 1,
+    noise_floor: float = 0.0,
 ) -> dict:
     """
     Calculate net ball progression from a sequence of ball X positions.
@@ -710,6 +740,12 @@ def ball_progression(
         play_direction: ``+1`` if increasing X is the attacking direction,
             ``-1`` if decreasing X is the attacking direction.  Defaults to
             ``+1``.
+        noise_floor: Minimum absolute displacement per step to be counted.
+            Steps whose absolute value is at or below this threshold are
+            treated as noise and discarded.  Defaults to ``0.0`` (no
+            filtering).  Set to a small positive value (e.g. the pixel
+            equivalent of 5 px after homography conversion) to suppress
+            camera-jitter artifacts.
 
     Returns:
         A dict with keys:
@@ -723,9 +759,9 @@ def ball_progression(
     if len(arr) < 2:
         return {"forward_m": 0.0, "backward_m": 0.0, "net_m": 0.0}
 
-    delta = np.diff(arr) * float(play_direction)
-    forward_m = float(delta[delta > 0].sum())
-    backward_m = float(np.abs(delta[delta < 0]).sum())
+    forward_m, backward_m = _progression_from_delta(
+        np.diff(arr), play_dir=play_direction, noise_floor=noise_floor
+    )
     return {
         "forward_m": forward_m,
         "backward_m": backward_m,
@@ -1065,6 +1101,7 @@ def build_match_report(
     n_lanes: int = 5,
     xt_grid: Optional[np.ndarray] = None,
     decimal_places: int = 4,
+    ball_noise_floor_px: float = 0.0,
 ) -> dict:
     """
     Build a comprehensive match statistics report as a JSON-serializable dict.
@@ -1108,6 +1145,13 @@ def build_match_report(
             default xT grid inside :func:`expected_threat`.
         decimal_places: Rounding precision for all floating-point output
             values.  Defaults to 4.
+        ball_noise_floor_px: Minimum frame-to-frame ball displacement (in the
+            same units as *ball_pitch_x* / *ball_pitch_y*) to be counted as
+            real movement for progression calculations.  Steps at or below
+            this threshold are discarded as camera-jitter noise.  Defaults to
+            ``0.0`` (no filtering).  When pixel coordinates are used instead
+            of true metres (i.e. homography is unavailable), set this to
+            approximately ``5.0`` pixels to suppress sub-pixel jitter.
 
     Returns:
         A nested dict that is fully JSON-serializable (all values are native
@@ -1211,9 +1255,9 @@ def build_match_report(
         poss_for_delta = np.array([], dtype=int)
 
     def _progression_block(delta: np.ndarray, play_dir: int) -> dict:
-        d = delta * float(play_dir)
-        fwd = float(d[d > 0].sum()) if len(d) > 0 else 0.0
-        bwd = float(np.abs(d[d < 0]).sum()) if len(d) > 0 else 0.0
+        fwd, bwd = _progression_from_delta(
+            delta, play_dir=play_dir, noise_floor=ball_noise_floor_px
+        )
         return {
             "forward_m": _r(fwd, dp),
             "backward_m": _r(bwd, dp),
