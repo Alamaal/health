@@ -61,6 +61,18 @@ class TestDefaults:
         reid = PlayerReIdentifier()
         assert abs(reid._position_tolerance - 120.0) < 1e-9
 
+    def test_invalid_max_frames_lost_raises(self):
+        with pytest.raises(ValueError):
+            PlayerReIdentifier(max_frames_lost=0)
+
+    def test_invalid_min_consecutive_frames_raises(self):
+        with pytest.raises(ValueError):
+            PlayerReIdentifier(min_consecutive_frames=0)
+
+    def test_invalid_position_tolerance_raises(self):
+        with pytest.raises(ValueError):
+            PlayerReIdentifier(position_tolerance_px=-1.0)
+
 
 # ---------------------------------------------------------------------------
 # has_tracker_id
@@ -374,3 +386,94 @@ class TestGalleryEmbeddingUpdate:
 
         stored = reid._gallery[cid]["embedding"]
         np.testing.assert_array_almost_equal(stored, emb)
+
+
+# ---------------------------------------------------------------------------
+# min_consecutive_frames  — ID stabilisation
+# ---------------------------------------------------------------------------
+
+class TestMinConsecutiveFrames:
+    """Tests for the min_consecutive_frames ID-stabilisation feature."""
+
+    def test_default_min_consecutive_frames_is_one(self):
+        """Default value of min_consecutive_frames should be 1 (legacy behaviour)."""
+        reid = PlayerReIdentifier()
+        assert reid._min_consecutive_frames == 1
+
+    def test_provisional_id_before_threshold(self):
+        """Before min_consecutive_frames is met, the raw tracker_id is returned."""
+        reid = _make_reid(min_consecutive_frames=3)
+        # Frames 1 and 2: tracker ID=5 visible, but threshold=3 not yet met.
+        result_f1 = reid.get_stable_id(5, np.array([100.0, 100.0]))
+        reid.end_frame()
+        result_f2 = reid.get_stable_id(5, np.array([100.0, 100.0]))
+        reid.end_frame()
+        # Provisional IDs equal the raw tracker_id.
+        assert result_f1 == 5
+        assert result_f2 == 5
+        # Gallery must not contain an entry for tracker 5 yet.
+        assert 5 not in reid._id_map
+
+    def test_confirmed_after_threshold(self):
+        """Track is promoted to the gallery exactly when min_consecutive_frames is reached."""
+        reid = _make_reid(min_consecutive_frames=3)
+        for _ in range(2):
+            reid.get_stable_id(5, np.array([100.0, 100.0]))
+            reid.end_frame()
+        # Third frame — should now be confirmed.
+        cid = reid.get_stable_id(5, np.array([100.0, 100.0]))
+        reid.end_frame()
+        assert 5 in reid._id_map
+        assert reid._id_map[5] == cid
+
+    def test_confirmed_id_is_stable_after_promotion(self):
+        """Once confirmed, the same canonical ID is returned on every subsequent frame."""
+        reid = _make_reid(min_consecutive_frames=2)
+        reid.get_stable_id(7, np.array([200.0, 300.0]))
+        reid.end_frame()
+        cid_first_confirmed = reid.get_stable_id(7, np.array([200.0, 300.0]))
+        reid.end_frame()
+
+        cid_later = reid.get_stable_id(7, np.array([202.0, 301.0]))
+        reid.end_frame()
+        assert cid_later == cid_first_confirmed
+
+    def test_interruption_resets_consecutive_counter(self):
+        """If the tracker vanishes before the threshold, its counter is reset."""
+        reid = _make_reid(min_consecutive_frames=3, position_tolerance_px=500.0)
+        # Appear for 2 frames (below threshold=3).
+        reid.get_stable_id(9, np.array([100.0, 100.0]))
+        reid.end_frame()
+        reid.get_stable_id(9, np.array([100.0, 100.0]))
+        reid.end_frame()
+
+        # One frame of absence — counter should reset.
+        reid.end_frame()
+
+        # Appear again — counter starts from 1.
+        result = reid.get_stable_id(9, np.array([100.0, 100.0]))
+        assert result == 9            # still provisional (count=1, threshold=3)
+        assert 9 not in reid._id_map  # not yet in gallery
+
+    def test_legacy_behaviour_when_min_is_one(self):
+        """When min_consecutive_frames=1, every detection is immediately promoted."""
+        reid = _make_reid(min_consecutive_frames=1)
+        cid = reid.get_stable_id(3, np.array([50.0, 50.0]))
+        assert 3 in reid._id_map
+        assert reid._id_map[3] == cid
+
+    def test_ephemeral_tracks_do_not_pollute_gallery(self):
+        """Short-lived tracks (< threshold) are never added to the gallery."""
+        reid = _make_reid(min_consecutive_frames=5, position_tolerance_px=500.0)
+        # Tracker 11 appears for only 2 frames then vanishes.
+        for _ in range(2):
+            reid.get_stable_id(11, np.array([300.0, 300.0]))
+            reid.end_frame()
+        # Tracker 11 disappears.
+        reid.end_frame()
+        reid.end_frame()
+        reid.end_frame()
+
+        # The gallery should be empty — tracker 11 never reached the threshold.
+        assert 11 not in reid._id_map
+        assert len(reid._gallery) == 0

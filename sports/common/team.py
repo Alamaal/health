@@ -230,6 +230,7 @@ class PlayerReIdentifier:
         max_frames_lost: int = 900,
         position_tolerance_px: float = 120.0,
         embedding_similarity_threshold: float = 0.85,
+        min_consecutive_frames: int = 1,
     ) -> None:
         """
         Initialise the re-identifier.
@@ -241,26 +242,49 @@ class PlayerReIdentifier:
             position_tolerance_px (float): Maximum Euclidean distance (in source
                 image pixels) between a newly-created track and a gallery entry
                 for them to be considered the same player (spatial fallback).
-                Defaults to 120.
+                Defaults to 120.  Increase this value (e.g. to 200) for
+                lower-quality footage where player positions are less stable.
             embedding_similarity_threshold (float): Minimum cosine similarity
                 between two player visual embeddings for a re-identification
                 match to be accepted.  Only applied when embeddings are
                 available for both the new track and the gallery entry.
                 Defaults to 0.85.
+            min_consecutive_frames (int): A brand-new tracker ID must appear
+                in this many *consecutive* frames before it is promoted to the
+                gallery and given a stable canonical ID.  Ephemeral detections
+                (e.g. false positives or one-frame blobs) that vanish before
+                reaching this threshold are never added to the gallery, which
+                dramatically reduces ID-explosion in lower-quality footage.
+                Defaults to 1 (every detection is immediately promoted,
+                matching legacy behaviour).  Set to 10 for a significant
+                reduction in spurious IDs.
         """
+        if int(max_frames_lost) < 1:
+            raise ValueError(f"max_frames_lost must be >= 1, got {max_frames_lost!r}")
+        if float(position_tolerance_px) < 0.0:
+            raise ValueError(
+                f"position_tolerance_px must be >= 0, got {position_tolerance_px!r}"
+            )
+        if int(min_consecutive_frames) < 1:
+            raise ValueError(
+                f"min_consecutive_frames must be >= 1, got {min_consecutive_frames!r}"
+            )
         self._max_frames_lost = int(max_frames_lost)
         self._position_tolerance = float(position_tolerance_px)
         self._embedding_similarity_threshold = float(embedding_similarity_threshold)
+        self._min_consecutive_frames = int(min_consecutive_frames)
 
         # gallery: canonical_tid → {
         #   'xy': ndarray, 'team_id': int|None, 'age': int,
         #   'embedding': ndarray|None
         # }
         self._gallery: Dict[int, dict] = {}
-        # raw tracker_id → canonical_id  (set on first sight of tracker_id)
+        # raw tracker_id → canonical_id  (set once min_consecutive_frames is met)
         self._id_map: Dict[int, int] = {}
         # raw tracker IDs seen in the *current* frame (cleared in end_frame)
         self._active_tids: set = set()
+        # tracker_id → consecutive-frame count for unconfirmed (pending) tracks
+        self._pending: Dict[int, int] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -274,11 +298,16 @@ class PlayerReIdentifier:
         extraction is needed — embeddings are only required for brand-new
         tracker IDs that have not yet been assigned a canonical ID.
 
+        Note: returns *False* for tracks that are in the *pending* state
+        (accumulating consecutive frames toward *min_consecutive_frames*),
+        so that embeddings continue to be extracted until the track is
+        promoted to confirmed.
+
         Args:
             tracker_id (int): Raw tracker ID from ByteTrack.
 
         Returns:
-            bool: ``True`` if the tracker ID has a canonical mapping.
+            bool: ``True`` if the tracker ID has a confirmed canonical mapping.
         """
         return int(tracker_id) in self._id_map
 
@@ -317,7 +346,9 @@ class PlayerReIdentifier:
                 updated via a running average.
 
         Returns:
-            int: Stable canonical player ID.
+            int: Stable canonical player ID.  For tracks that have not yet
+                met *min_consecutive_frames*, the raw *tracker_id* is
+                returned as a provisional ID (no gallery entry is created).
         """
         tracker_id = int(tracker_id)
         self._active_tids.add(tracker_id)
@@ -338,7 +369,15 @@ class PlayerReIdentifier:
             }
             return canonical
 
-        # Brand-new tracker ID — search gallery for a position or embedding match.
+        # Unconfirmed tracker — increment pending counter.
+        self._pending[tracker_id] = self._pending.get(tracker_id, 0) + 1
+        if self._pending[tracker_id] < self._min_consecutive_frames:
+            # Not yet seen enough consecutive frames; return provisional ID
+            # without creating a gallery entry.
+            return tracker_id
+
+        # Threshold reached — promote track to confirmed and search gallery.
+        del self._pending[tracker_id]
         canonical = self._find_match(xy, team_id, embedding)
         self._id_map[tracker_id] = canonical
         self._gallery[canonical] = {
@@ -378,6 +417,12 @@ class PlayerReIdentifier:
 
         for canon_tid in to_remove:
             del self._gallery[canon_tid]
+
+        # Drop pending counters for tracker IDs that were not seen this frame,
+        # so that the consecutive-frame requirement resets on absence.
+        for tid in list(self._pending.keys()):
+            if tid not in current_raw:
+                del self._pending[tid]
 
         self._active_tids = set()
 
