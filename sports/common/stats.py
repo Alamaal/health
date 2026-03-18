@@ -688,3 +688,314 @@ def draw_pass_label(
     cv2.rectangle(frame, (tx - 4, ty - th - 4), (tx + tw + 4, ty + 4), (0, 0, 0), -1)
     cv2.putText(frame, label, (tx, ty), font, scale, (0, 255, 255), thickness)
     return frame
+
+
+# ---------------------------------------------------------------------------
+# Pitch analytics helpers
+# ---------------------------------------------------------------------------
+
+def ball_progression(
+    pitch_x: np.ndarray,
+    play_direction: int = 1,
+) -> dict:
+    """
+    Calculate net ball progression from a sequence of ball X positions.
+
+    Uses frame-to-frame differences of the ball's X coordinate to separate
+    forward movement (in the play direction) from backward movement.
+
+    Args:
+        pitch_x: 1-D array of ball X positions in pitch metres along the
+            length axis.
+        play_direction: ``+1`` if increasing X is the attacking direction,
+            ``-1`` if decreasing X is the attacking direction.  Defaults to
+            ``+1``.
+
+    Returns:
+        A dict with keys:
+
+        - ``forward_m`` (float): Total metres moved in the attacking direction.
+        - ``backward_m`` (float): Total metres moved against the attacking
+          direction (always positive).
+        - ``net_m`` (float): Net progression (``forward_m - backward_m``).
+    """
+    arr = np.asarray(pitch_x, dtype=float).ravel()
+    if len(arr) < 2:
+        return {"forward_m": 0.0, "backward_m": 0.0, "net_m": 0.0}
+
+    delta = np.diff(arr) * float(play_direction)
+    forward_m = float(delta[delta > 0].sum())
+    backward_m = float(np.abs(delta[delta < 0]).sum())
+    return {
+        "forward_m": forward_m,
+        "backward_m": backward_m,
+        "net_m": forward_m - backward_m,
+    }
+
+
+def defensive_leakage(
+    ball_pitch_x: np.ndarray,
+    ball_pitch_y: np.ndarray,
+    possession_team: np.ndarray,
+    opponent_team_id: int,
+    box_x_range: Tuple[float, float],
+    box_y_range: Tuple[float, float],
+) -> int:
+    """
+    Count frames in which the opponent has possession inside the penalty box.
+
+    Args:
+        ball_pitch_x: 1-D array of ball X positions in pitch metres.
+        ball_pitch_y: 1-D array of ball Y positions in pitch metres.
+        possession_team: 1-D integer array of the team ID with possession at
+            each frame.  Use ``-1`` for contested / unknown frames.
+        opponent_team_id: The team ID of the opponent.
+        box_x_range: ``(x_min, x_max)`` metres defining the penalty box along
+            the length axis.
+        box_y_range: ``(y_min, y_max)`` metres defining the penalty box along
+            the width axis.
+
+    Returns:
+        Number of frames where the opponent has the ball inside the box.
+    """
+    bx = np.asarray(ball_pitch_x, dtype=float).ravel()
+    by = np.asarray(ball_pitch_y, dtype=float).ravel()
+    team = np.asarray(possession_team, dtype=int).ravel()
+
+    n = min(len(bx), len(by), len(team))
+    bx, by, team = bx[:n], by[:n], team[:n]
+
+    x_min, x_max = float(box_x_range[0]), float(box_x_range[1])
+    y_min, y_max = float(box_y_range[0]), float(box_y_range[1])
+
+    in_box = (bx >= x_min) & (bx <= x_max) & (by >= y_min) & (by <= y_max)
+    is_opponent = team == opponent_team_id
+    return int(np.sum(in_box & is_opponent))
+
+
+def vertical_lane_density(
+    positions: np.ndarray,
+    pitch_dim_m: float,
+    n_lanes: int = 5,
+) -> np.ndarray:
+    """
+    Count how many positions fall in each of *n_lanes* equal vertical lanes.
+
+    Vertical lanes divide the *width* dimension of the pitch (Y axis).  Pass
+    ball Y coordinates to analyse ball utilisation; pass player Y coordinates
+    to analyse player distribution.
+
+    Args:
+        positions: 1-D array of Y (or X) positions in pitch metres.
+        pitch_dim_m: Total extent of the dimension in metres (e.g. pitch width
+            68 m).
+        n_lanes: Number of equal lanes to divide the dimension into.  Defaults
+            to 5.
+
+    Returns:
+        Integer ``ndarray`` of shape ``(n_lanes,)`` with the count in each
+        lane, from the lowest value to the highest.
+    """
+    positions = np.asarray(positions, dtype=float).ravel()
+    n_lanes = max(1, int(n_lanes))
+    lane_width = float(pitch_dim_m) / n_lanes
+    counts = np.zeros(n_lanes, dtype=int)
+    for pos in positions:
+        idx = int(pos / lane_width)
+        idx = max(0, min(n_lanes - 1, idx))
+        counts[idx] += 1
+    return counts
+
+
+def possession_by_thirds(
+    ball_pitch_x: np.ndarray,
+    pitch_length_m: float,
+    team_possession: np.ndarray,
+    team_id: int,
+) -> Tuple[float, float, float]:
+    """
+    Calculate what percentage of a team's possession occurs in each pitch third.
+
+    The pitch is divided into three equal thirds along the length axis (X).
+    Only frames attributed to *team_id* are considered.
+
+    Args:
+        ball_pitch_x: 1-D array of ball X positions in pitch metres.
+        pitch_length_m: Full pitch length in metres.
+        team_possession: 1-D integer array of the possessing team ID per
+            frame.  Use ``-1`` for contested frames.
+        team_id: The team whose possession thirds should be reported.
+
+    Returns:
+        A tuple ``(defensive_pct, middle_pct, attacking_pct)`` where each
+        value is the percentage of the team's possession frames located in that
+        third.  Returns ``(0.0, 0.0, 0.0)`` if the team has no possession
+        frames.
+    """
+    bx = np.asarray(ball_pitch_x, dtype=float).ravel()
+    team = np.asarray(team_possession, dtype=int).ravel()
+
+    n = min(len(bx), len(team))
+    bx, team = bx[:n], team[:n]
+
+    owned = bx[team == team_id]
+    total = len(owned)
+    if total == 0:
+        return (0.0, 0.0, 0.0)
+
+    third = float(pitch_length_m) / 3.0
+    def_pct = float(np.sum(owned < third)) / total * 100.0
+    mid_pct = float(np.sum((owned >= third) & (owned < 2 * third))) / total * 100.0
+    att_pct = float(np.sum(owned >= 2 * third)) / total * 100.0
+    return (def_pct, mid_pct, att_pct)
+
+
+def team_compactness(
+    player_positions: np.ndarray,
+) -> float:
+    """
+    Compute the area of the axis-aligned bounding rectangle around all players.
+
+    Args:
+        player_positions: ``(N, 2)`` array of ``[x, y]`` positions in pitch
+            metres.  Fewer than 2 points returns 0.0.
+
+    Returns:
+        Bounding-box area in square metres.  Zero if fewer than two players
+        are provided.
+    """
+    pts = np.asarray(player_positions, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 2:
+        return 0.0
+    width = float(pts[:, 0].max() - pts[:, 0].min())
+    height = float(pts[:, 1].max() - pts[:, 1].min())
+    return width * height
+
+
+def space_creation(
+    attacker_xy: np.ndarray,
+    defender_positions: np.ndarray,
+) -> float:
+    """
+    Measure the distance between an attacker and the defensive centroid.
+
+    A larger distance indicates the attacker has created more space between
+    themselves and the opponent's defensive block.
+
+    Args:
+        attacker_xy: ``[x, y]`` position of the attacker in pitch metres.
+        defender_positions: ``(N, 2)`` array of ``[x, y]`` positions of the
+            defending team in pitch metres.  At least one defender is required.
+
+    Returns:
+        Euclidean distance in metres between the attacker and the mean
+        position of the defenders.  Returns 0.0 if *defender_positions* is
+        empty.
+    """
+    axy = np.asarray(attacker_xy, dtype=float).ravel()[:2]
+    defs = np.asarray(defender_positions, dtype=float)
+    if defs.ndim != 2 or defs.shape[1] != 2 or len(defs) == 0:
+        return 0.0
+    centroid = defs.mean(axis=0)
+    return float(np.linalg.norm(axy - centroid))
+
+
+def _build_xt_grid() -> np.ndarray:
+    """Build the default 16×12 static xT grid.
+
+    Values are generated from a geometric approximation of expected threat
+    based on Karun Singh's framework:
+    ``P(shot|zone) × P(goal|shot,zone)`` using distance and angle to goal.
+    Column 0 = defensive end, column 15 = attacking end.
+    """
+    cols = np.arange(16)[np.newaxis, :]   # shape (1, 16)
+    rows = np.arange(12)[:, np.newaxis]   # shape (12, 1)
+    gl, gw = 105.0, 68.0                  # pitch dimensions used for grid
+    x = (cols + 0.5) * gl / 16
+    y = (rows + 0.5) * gw / 12
+    dist = np.sqrt((gl - x) ** 2 + (gw / 2 - y) ** 2)
+    # Angle subtended by goal (7.32 m wide) from position (x, y)
+    d_sq = (gl - x) ** 2 + (gw / 2 - y) ** 2
+    angle = np.where(
+        d_sq < 1e-6,
+        0.0,
+        np.arctan2(7.32 * (gl - x), d_sq - (7.32 / 2) ** 2).clip(0, np.pi),
+    )
+    # P(shot) × P(goal|shot) approximation
+    raw = 1.0 / (1.0 + np.exp(0.16 * dist - 2.6)) * (angle / np.pi) ** 0.5
+    return np.clip(raw, 0.0, 1.0).astype(np.float32)
+
+
+_XT_GRID_16x12 = _build_xt_grid()
+
+
+def expected_threat(
+    pitch_x: float,
+    pitch_y: float,
+    pitch_length_m: float,
+    pitch_width_m: float,
+    xt_grid: Optional[np.ndarray] = None,
+) -> float:
+    """
+    Return the expected-threat (xT) value for a ball position.
+
+    Uses a static 16-column × 12-row threat grid where column 0 corresponds
+    to the defensive end and column 15 to the attacking end.
+
+    Args:
+        pitch_x: Ball X position in pitch metres along the length axis.
+        pitch_y: Ball Y position in pitch metres along the width axis.
+        pitch_length_m: Full pitch length in metres.
+        pitch_width_m: Full pitch width in metres.
+        xt_grid: Optional ``(12, 16)`` float array overriding the default
+            static grid.  Rows correspond to the width axis, columns to the
+            length axis.
+
+    Returns:
+        xT value in ``[0, 1]`` for the given position.  Returns ``0.0`` for
+        positions outside the pitch boundaries.
+    """
+    grid = _XT_GRID_16x12 if xt_grid is None else np.asarray(xt_grid, dtype=float)
+    n_rows, n_cols = grid.shape
+
+    x = float(pitch_x)
+    y = float(pitch_y)
+    if x < 0 or x > pitch_length_m or y < 0 or y > pitch_width_m:
+        return 0.0
+
+    col = int(np.clip(x / pitch_length_m * n_cols, 0, n_cols - 1))
+    row = int(np.clip(y / pitch_width_m * n_rows, 0, n_rows - 1))
+    return float(grid[row, col])
+
+
+def pitch_width_utilization(
+    positions: np.ndarray,
+    pitch_width_m: float,
+    n_lanes: int = 5,
+) -> np.ndarray:
+    """
+    Calculate the percentage of activity in each vertical lane.
+
+    Identical to :func:`vertical_lane_density` but returns percentages rather
+    than raw counts.  Useful for reporting how well a team (or the ball)
+    utilises the full width of the pitch.
+
+    Lane order: ``[right-wing, right-half, central, left-half, left-wing]``
+    when the Y axis runs from right touchline (0) to left touchline
+    (*pitch_width_m*).
+
+    Args:
+        positions: 1-D array of Y positions in pitch metres.
+        pitch_width_m: Pitch width in metres (e.g. 68 m).
+        n_lanes: Number of equal lanes.  Defaults to 5.
+
+    Returns:
+        Float ``ndarray`` of shape ``(n_lanes,)`` with the percentage of
+        positions falling in each lane.  Sums to 100 when there is at least
+        one position; returns all-zeros for empty input.
+    """
+    counts = vertical_lane_density(positions, pitch_width_m, n_lanes)
+    total = counts.sum()
+    if total == 0:
+        return np.zeros(n_lanes, dtype=float)
+    return counts.astype(float) / total * 100.0
