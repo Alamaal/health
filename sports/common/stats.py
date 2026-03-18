@@ -923,7 +923,7 @@ def _build_xt_grid() -> np.ndarray:
     )
     # P(shot) × P(goal|shot) approximation
     raw = 1.0 / (1.0 + np.exp(0.16 * dist - 2.6)) * (angle / np.pi) ** 0.5
-    return np.clip(raw, 0.0, 1.0).astype(np.float32)
+    return np.clip(raw, 0.0, 1.0).astype(np.float64)
 
 
 _XT_GRID_16x12 = _build_xt_grid()
@@ -999,3 +999,398 @@ def pitch_width_utilization(
     if total == 0:
         return np.zeros(n_lanes, dtype=float)
     return counts.astype(float) / total * 100.0
+
+
+# ---------------------------------------------------------------------------
+# JSON match report
+# ---------------------------------------------------------------------------
+
+_LANE_LABELS_5: Tuple[str, ...] = (
+    "right_wing",
+    "right_half",
+    "central",
+    "left_half",
+    "left_wing",
+)
+
+
+def _r(val: float, ndigits: int) -> float:
+    """Round *val* to *ndigits* decimal places; return a native Python float."""
+    return round(float(val), ndigits)
+
+
+def _arr_summary(arr: np.ndarray, ndigits: int) -> dict:
+    """
+    Return descriptive statistics for a 1-D numeric array as a JSON-safe dict.
+
+    Keys: ``count`` (int), ``mean``, ``std``, ``min``, ``max``, ``median``
+    (float rounded to *ndigits*).  ``None`` is used for each stat when *arr*
+    is empty.  Standard deviation uses the population formula (``ddof=0``).
+    """
+    a = np.asarray(arr, dtype=float).ravel()
+    if len(a) == 0:
+        return {
+            "count": 0,
+            "mean": None,
+            "std": None,
+            "min": None,
+            "max": None,
+            "median": None,
+        }
+    return {
+        "count": int(len(a)),
+        "mean": _r(np.mean(a), ndigits),
+        "std": _r(np.std(a, ddof=0), ndigits),
+        "min": _r(np.min(a), ndigits),
+        "max": _r(np.max(a), ndigits),
+        "median": _r(np.median(a), ndigits),
+    }
+
+
+def build_match_report(
+    ball_pitch_x: np.ndarray,
+    ball_pitch_y: np.ndarray,
+    possession_team: np.ndarray,
+    fps: float = 25.0,
+    pitch_length_m: float = 105.0,
+    pitch_width_m: float = 68.0,
+    team_labels: Tuple[str, str] = ("team_0", "team_1"),
+    play_directions: Tuple[int, int] = (1, -1),
+    passes_team0: int = 0,
+    passes_team1: int = 0,
+    team0_positions_per_frame: Optional[List[np.ndarray]] = None,
+    team1_positions_per_frame: Optional[List[np.ndarray]] = None,
+    penalty_area_length_m: float = 16.5,
+    penalty_area_width_m: float = 40.32,
+    n_lanes: int = 5,
+    xt_grid: Optional[np.ndarray] = None,
+    decimal_places: int = 4,
+) -> dict:
+    """
+    Build a comprehensive match statistics report as a JSON-serializable dict.
+
+    All individual analytics functions (:func:`ball_progression`,
+    :func:`defensive_leakage`, :func:`possession_by_thirds`,
+    :func:`team_compactness`, :func:`space_creation`,
+    :func:`expected_threat`, :func:`pitch_width_utilization`) are called
+    internally and their results combined into one rich, nested dict.
+
+    All floating-point values are rounded to *decimal_places* decimal places
+    (default 4) for high-precision output.  Internal calculations always use
+    float64.
+
+    Args:
+        ball_pitch_x: 1-D array of ball X positions in pitch metres.
+        ball_pitch_y: 1-D array of ball Y positions in pitch metres.
+        possession_team: 1-D int array; team ID owning the ball each frame
+            (``0`` or ``1``), or ``-1`` for contested / unknown frames.
+        fps: Video frame rate in frames per second.  Used to convert frame
+            counts to durations.  Defaults to 25.0.
+        pitch_length_m: Pitch length in metres (X axis).  Defaults to 105.0.
+        pitch_width_m: Pitch width in metres (Y axis).  Defaults to 68.0.
+        team_labels: Display names for team 0 and team 1.
+        play_directions: ``(+1, -1)`` means team 0 attacks toward increasing X
+            and team 1 toward decreasing X.
+        passes_team0: Accumulated pass count for team 0 (from
+            :class:`PassDetector`).
+        passes_team1: Accumulated pass count for team 1.
+        team0_positions_per_frame: Optional list of ``(N_players, 2)`` arrays,
+            one per frame, giving team 0 player X/Y positions in pitch metres.
+            Required for compactness and centroid-separation stats.
+        team1_positions_per_frame: Same for team 1.
+        penalty_area_length_m: Length of the penalty area from the goal line
+            in metres.  Defaults to 16.5 (standard FIFA).
+        penalty_area_width_m: Width of the penalty area in metres.  Defaults
+            to 40.32 (standard FIFA).
+        n_lanes: Number of equal vertical lanes for width-utilisation stats.
+            Defaults to 5.
+        xt_grid: Optional ``(n_rows, n_cols)`` float array overriding the
+            default xT grid inside :func:`expected_threat`.
+        decimal_places: Rounding precision for all floating-point output
+            values.  Defaults to 4.
+
+    Returns:
+        A nested dict that is fully JSON-serializable (all values are native
+        Python scalars, lists, or dicts — no NumPy objects).  Top-level keys:
+
+        - ``"meta"`` — pitch/video metadata and report parameters.
+        - ``"possession"`` — frame counts, percentages (of total and of owned
+          frames), and durations in seconds.
+        - ``"passes"`` — per-team pass counts.
+        - ``"ball_progression"`` — overall and per-team forward / backward /
+          net metres, computed from frame-to-frame ball deltas attributed to
+          the possessing team.
+        - ``"ball_position_stats"`` — descriptive statistics of ball X and Y
+          for all frames and split by possessing team.
+        - ``"possession_by_thirds"`` — per-team possession split across
+          defensive / middle / attacking thirds with percentage and frame count.
+        - ``"defensive_leakage"`` — frames and duration the opponent held the
+          ball inside each team's penalty area.
+        - ``"pitch_width_utilization"`` — percentage and count of ball/player
+          activity in each vertical lane.
+        - ``"expected_threat"`` — descriptive statistics and total accumulated
+          xT for all frames and per possessing team.
+        - ``"team_compactness"`` — bounding-box area statistics per team
+          (``None`` when positions are not provided).
+        - ``"team_separation"`` — centroid-to-centroid distance statistics
+          across all frames (``None`` when positions are not provided).
+    """
+    dp = int(decimal_places)
+
+    # ── align input arrays ──────────────────────────────────────────────────
+    bx = np.asarray(ball_pitch_x, dtype=float).ravel()
+    by = np.asarray(ball_pitch_y, dtype=float).ravel()
+    poss = np.asarray(possession_team, dtype=int).ravel()
+    n = min(len(bx), len(by), len(poss))
+    bx, by, poss = bx[:n], by[:n], poss[:n]
+
+    lbl0, lbl1 = str(team_labels[0]), str(team_labels[1])
+    dir0, dir1 = int(play_directions[0]), int(play_directions[1])
+    fps = float(fps)
+
+    if n_lanes == 5:
+        lane_labels: List[str] = list(_LANE_LABELS_5)
+    else:
+        lane_labels = [f"lane_{i + 1}" for i in range(n_lanes)]
+
+    # ── meta ────────────────────────────────────────────────────────────────
+    meta: dict = {
+        "pitch_length_m": _r(pitch_length_m, dp),
+        "pitch_width_m": _r(pitch_width_m, dp),
+        "total_frames": n,
+        "fps": _r(fps, dp),
+        "duration_sec": _r(n / fps, dp) if fps > 0 else None,
+        "team_labels": {"0": lbl0, "1": lbl1},
+        "n_lanes": n_lanes,
+        "lane_labels": lane_labels,
+        "penalty_area_length_m": _r(penalty_area_length_m, dp),
+        "penalty_area_width_m": _r(penalty_area_width_m, dp),
+        "decimal_places": dp,
+    }
+
+    # ── possession ──────────────────────────────────────────────────────────
+    t0_frames = int(np.sum(poss == 0))
+    t1_frames = int(np.sum(poss == 1))
+    contested_frames = int(np.sum(poss == -1))
+    owned_frames = t0_frames + t1_frames
+
+    def _poss_block(frames: int) -> dict:
+        pct_total = _r(frames / n * 100, dp) if n > 0 else 0.0
+        pct_owned = _r(frames / owned_frames * 100, dp) if owned_frames > 0 else 0.0
+        duration = _r(frames / fps, dp) if fps > 0 else None
+        return {
+            "frames": frames,
+            "pct_of_total": pct_total,
+            "pct_of_owned": pct_owned,
+            "duration_sec": duration,
+        }
+
+    possession_section: dict = {
+        lbl0: _poss_block(t0_frames),
+        lbl1: _poss_block(t1_frames),
+        "contested": {
+            "frames": contested_frames,
+            "pct_of_total": _r(contested_frames / n * 100, dp) if n > 0 else 0.0,
+            "duration_sec": _r(contested_frames / fps, dp) if fps > 0 else None,
+        },
+    }
+
+    # ── passes ──────────────────────────────────────────────────────────────
+    passes_section: dict = {
+        lbl0: int(passes_team0),
+        lbl1: int(passes_team1),
+    }
+
+    # ── ball progression ────────────────────────────────────────────────────
+    # Frame-to-frame deltas attributed to the possessing team at frame i.
+    if n > 1:
+        delta_x_raw = np.diff(bx)
+        poss_for_delta = poss[:n - 1]
+    else:
+        delta_x_raw = np.array([], dtype=float)
+        poss_for_delta = np.array([], dtype=int)
+
+    def _progression_block(delta: np.ndarray, play_dir: int) -> dict:
+        d = delta * float(play_dir)
+        fwd = float(d[d > 0].sum()) if len(d) > 0 else 0.0
+        bwd = float(np.abs(d[d < 0]).sum()) if len(d) > 0 else 0.0
+        return {
+            "forward_m": _r(fwd, dp),
+            "backward_m": _r(bwd, dp),
+            "net_m": _r(fwd - bwd, dp),
+        }
+
+    ball_progression_section: dict = {
+        "overall": _progression_block(delta_x_raw, dir0),
+        lbl0: _progression_block(delta_x_raw[poss_for_delta == 0], dir0),
+        lbl1: _progression_block(delta_x_raw[poss_for_delta == 1], dir1),
+    }
+
+    # ── ball position statistics ────────────────────────────────────────────
+    ball_position_section: dict = {
+        "x": _arr_summary(bx, dp),
+        "y": _arr_summary(by, dp),
+        "x_during_" + lbl0: _arr_summary(bx[poss == 0], dp),
+        "x_during_" + lbl1: _arr_summary(bx[poss == 1], dp),
+        "y_during_" + lbl0: _arr_summary(by[poss == 0], dp),
+        "y_during_" + lbl1: _arr_summary(by[poss == 1], dp),
+    }
+
+    # ── possession by thirds ────────────────────────────────────────────────
+    def _thirds_block(team_id: int) -> dict:
+        d, m, a = possession_by_thirds(bx, pitch_length_m, poss, team_id)
+        team_frames = int(np.sum(poss == team_id))
+        frames_def = int(round(d / 100.0 * team_frames)) if team_frames > 0 else 0
+        frames_mid = int(round(m / 100.0 * team_frames)) if team_frames > 0 else 0
+        frames_att = max(0, team_frames - frames_def - frames_mid)
+        return {
+            "defensive_third": {"pct": _r(d, dp), "frames": frames_def},
+            "middle_third": {"pct": _r(m, dp), "frames": frames_mid},
+            "attacking_third": {"pct": _r(a, dp), "frames": frames_att},
+        }
+
+    thirds_section: dict = {
+        lbl0: _thirds_block(0),
+        lbl1: _thirds_block(1),
+    }
+
+    # ── defensive leakage ───────────────────────────────────────────────────
+    y_box_min = (pitch_width_m - penalty_area_width_m) / 2.0
+    y_box_max = (pitch_width_m + penalty_area_width_m) / 2.0
+    if dir0 > 0:
+        # team 0 attacks right → defends left (x = 0)
+        t0_def_box_x: Tuple[float, float] = (0.0, penalty_area_length_m)
+        t1_def_box_x: Tuple[float, float] = (
+            pitch_length_m - penalty_area_length_m,
+            pitch_length_m,
+        )
+    else:
+        t0_def_box_x = (pitch_length_m - penalty_area_length_m, pitch_length_m)
+        t1_def_box_x = (0.0, penalty_area_length_m)
+    box_y: Tuple[float, float] = (y_box_min, y_box_max)
+
+    def _leakage_block(box_x: Tuple[float, float], opponent_id: int) -> dict:
+        frames = defensive_leakage(bx, by, poss, opponent_id, box_x, box_y)
+        return {
+            "frames_opponent_in_box": frames,
+            "pct_of_total": _r(frames / n * 100, dp) if n > 0 else 0.0,
+            "duration_sec": _r(frames / fps, dp) if fps > 0 else None,
+        }
+
+    leakage_section: dict = {
+        lbl0 + "_defensive_box": _leakage_block(t0_def_box_x, 1),
+        lbl1 + "_defensive_box": _leakage_block(t1_def_box_x, 0),
+    }
+
+    # ── pitch width utilization ─────────────────────────────────────────────
+    def _lane_block(y_positions: np.ndarray) -> dict:
+        pct = pitch_width_utilization(y_positions, pitch_width_m, n_lanes)
+        cnts = vertical_lane_density(y_positions, pitch_width_m, n_lanes)
+        return {
+            label: {"pct": _r(float(pct[i]), dp), "count": int(cnts[i])}
+            for i, label in enumerate(lane_labels)
+        }
+
+    width_section: dict = {
+        "ball": _lane_block(by),
+        "ball_during_" + lbl0: _lane_block(by[poss == 0]),
+        "ball_during_" + lbl1: _lane_block(by[poss == 1]),
+    }
+    if team0_positions_per_frame is not None:
+        chunks = [
+            np.asarray(pts, dtype=float)[:, 1]
+            for pts in team0_positions_per_frame
+            if (
+                np.asarray(pts).ndim == 2
+                and np.asarray(pts).shape[1] >= 2
+                and len(pts) > 0
+            )
+        ]
+        all_t0_y = np.concatenate(chunks) if chunks else np.array([], dtype=float)
+        width_section[lbl0 + "_players"] = _lane_block(all_t0_y)
+    if team1_positions_per_frame is not None:
+        chunks = [
+            np.asarray(pts, dtype=float)[:, 1]
+            for pts in team1_positions_per_frame
+            if (
+                np.asarray(pts).ndim == 2
+                and np.asarray(pts).shape[1] >= 2
+                and len(pts) > 0
+            )
+        ]
+        all_t1_y = np.concatenate(chunks) if chunks else np.array([], dtype=float)
+        width_section[lbl1 + "_players"] = _lane_block(all_t1_y)
+
+    # ── expected threat (xT) ────────────────────────────────────────────────
+    xt_vals = np.array(
+        [
+            expected_threat(float(x), float(y), pitch_length_m, pitch_width_m, xt_grid)
+            for x, y in zip(bx, by)
+        ],
+        dtype=float,
+    )
+    xt_t0 = xt_vals[poss == 0]
+    xt_t1 = xt_vals[poss == 1]
+    xt_all_summary = _arr_summary(xt_vals, dp)
+    xt_t0_summary = _arr_summary(xt_t0, dp)
+    xt_t1_summary = _arr_summary(xt_t1, dp)
+    xt_t0_summary["total_xt"] = _r(float(xt_t0.sum()), dp)
+    xt_t1_summary["total_xt"] = _r(float(xt_t1.sum()), dp)
+    xt_section: dict = {
+        "ball": xt_all_summary,
+        "ball_during_" + lbl0: xt_t0_summary,
+        "ball_during_" + lbl1: xt_t1_summary,
+    }
+
+    # ── team compactness ────────────────────────────────────────────────────
+    def _compact_stats(positions_per_frame: Optional[List[np.ndarray]]) -> Optional[dict]:
+        if positions_per_frame is None:
+            return None
+        areas = []
+        for pts in positions_per_frame:
+            a = np.asarray(pts, dtype=float)
+            if a.ndim == 2 and a.shape[1] == 2 and len(a) >= 2:
+                areas.append(team_compactness(a))
+        return _arr_summary(np.array(areas, dtype=float), dp)
+
+    compactness_section: dict = {
+        lbl0: _compact_stats(team0_positions_per_frame),
+        lbl1: _compact_stats(team1_positions_per_frame),
+    }
+
+    # ── team separation (centroid-to-centroid distance) ─────────────────────
+    def _separation_stats(
+        t0_pos: Optional[List[np.ndarray]],
+        t1_pos: Optional[List[np.ndarray]],
+    ) -> Optional[dict]:
+        if t0_pos is None or t1_pos is None:
+            return None
+        distances = []
+        for pts0, pts1 in zip(t0_pos, t1_pos):
+            a0 = np.asarray(pts0, dtype=float)
+            a1 = np.asarray(pts1, dtype=float)
+            if (
+                a0.ndim == 2 and a0.shape[1] == 2 and len(a0) > 0
+                and a1.ndim == 2 and a1.shape[1] == 2 and len(a1) > 0
+            ):
+                distances.append(float(np.linalg.norm(a0.mean(axis=0) - a1.mean(axis=0))))
+        return _arr_summary(np.array(distances, dtype=float), dp)
+
+    separation_section = _separation_stats(
+        team0_positions_per_frame, team1_positions_per_frame
+    )
+
+    # ── assemble report ─────────────────────────────────────────────────────
+    return {
+        "meta": meta,
+        "possession": possession_section,
+        "passes": passes_section,
+        "ball_progression": ball_progression_section,
+        "ball_position_stats": ball_position_section,
+        "possession_by_thirds": thirds_section,
+        "defensive_leakage": leakage_section,
+        "pitch_width_utilization": width_section,
+        "expected_threat": xt_section,
+        "team_compactness": compactness_section,
+        "team_separation": separation_section,
+    }
