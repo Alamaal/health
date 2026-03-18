@@ -9,7 +9,19 @@ Covers:
 - PassEvent: dataclass record of a single pass
 - draw_stats_overlay / draw_pass_label: video overlay helpers
 - compute_stable_homography / transform_points_homography: pitch heatmap helpers
+- ball_progression: net ball progression from X-track data
+- defensive_leakage: opponent receptions inside penalty box
+- vertical_lane_density: player/ball density across vertical lanes
+- possession_by_thirds: possession share per pitch third
+- team_compactness: team bounding-box area
+- space_creation: attacker–defence centroid distance
+- expected_threat: static xT value for ball position
+- pitch_width_utilization: percentage activity per vertical lane
+- _arr_summary: descriptive statistics helper
+- build_match_report: comprehensive JSON match report
 """
+
+import json
 
 import numpy as np
 import pytest
@@ -19,11 +31,21 @@ from sports.common.stats import (
     PassEvent,
     PossessionTracker,
     TeamVoteBuffer,
+    _arr_summary,
+    ball_progression,
+    build_match_report,
     compute_stable_homography,
+    defensive_leakage,
     draw_pass_label,
     draw_stats_overlay,
+    expected_threat,
     perspective_owner_dist,
+    pitch_width_utilization,
+    possession_by_thirds,
+    space_creation,
+    team_compactness,
     transform_points_homography,
+    vertical_lane_density,
 )
 
 
@@ -632,3 +654,758 @@ class TestPitchHomographyHelpers:
         bad_frame = np.array([1, 2, 3], dtype=np.float32)  # 1-D, wrong shape
         H = compute_stable_homography([bad_frame, self._SRC], self._DST)
         assert H is not None  # falls back to the valid frame
+
+
+# ---------------------------------------------------------------------------
+# ball_progression
+# ---------------------------------------------------------------------------
+
+class TestBallProgression:
+    """ball_progression computes forward/backward/net metres from X track."""
+
+    def test_all_forward(self):
+        """Monotonically increasing X → all metres are forward."""
+        result = ball_progression(np.array([0.0, 10.0, 20.0, 35.0]))
+        assert abs(result["forward_m"] - 35.0) < 1e-9
+        assert result["backward_m"] == 0.0
+        assert abs(result["net_m"] - 35.0) < 1e-9
+
+    def test_all_backward(self):
+        """Monotonically decreasing X → all metres are backward."""
+        result = ball_progression(np.array([35.0, 20.0, 10.0, 0.0]))
+        assert result["forward_m"] == 0.0
+        assert abs(result["backward_m"] - 35.0) < 1e-9
+        assert abs(result["net_m"] - (-35.0)) < 1e-9
+
+    def test_mixed_movement(self):
+        """Mixed movement correctly splits forward and backward metres."""
+        # +20, -5, +10 → forward=30, backward=5, net=25
+        result = ball_progression(np.array([0.0, 20.0, 15.0, 25.0]))
+        assert abs(result["forward_m"] - 30.0) < 1e-9
+        assert abs(result["backward_m"] - 5.0) < 1e-9
+        assert abs(result["net_m"] - 25.0) < 1e-9
+
+    def test_reverse_play_direction(self):
+        """play_direction=-1 flips which movement is forward."""
+        # Ball moves from 35 → 0 (decreasing X) in the attacking direction
+        result = ball_progression(np.array([35.0, 20.0, 10.0]), play_direction=-1)
+        assert abs(result["forward_m"] - 25.0) < 1e-9
+        assert result["backward_m"] == 0.0
+
+    def test_single_point_returns_zeros(self):
+        """A single position has no movement; all values are 0."""
+        result = ball_progression(np.array([50.0]))
+        assert result == {"forward_m": 0.0, "backward_m": 0.0, "net_m": 0.0}
+
+    def test_empty_returns_zeros(self):
+        """Empty array returns zeros."""
+        result = ball_progression(np.array([]))
+        assert result == {"forward_m": 0.0, "backward_m": 0.0, "net_m": 0.0}
+
+    def test_stationary_ball_returns_zeros(self):
+        """Ball at the same position every frame returns all zeros."""
+        result = ball_progression(np.full(10, 52.5))
+        assert result == {"forward_m": 0.0, "backward_m": 0.0, "net_m": 0.0}
+
+
+# ---------------------------------------------------------------------------
+# defensive_leakage
+# ---------------------------------------------------------------------------
+
+class TestDefensiveLeakage:
+    """defensive_leakage counts opponent receptions inside the penalty box."""
+
+    def _make_arrays(self, bx, by, team):
+        return (
+            np.array(bx, dtype=float),
+            np.array(by, dtype=float),
+            np.array(team, dtype=int),
+        )
+
+    def test_opponent_in_box(self):
+        """Frames where opponent (team 1) has ball inside the box are counted."""
+        bx, by, team = self._make_arrays(
+            [85.0, 90.0, 95.0],
+            [25.0, 34.0, 43.0],
+            [1, 1, 0],
+        )
+        # box: x in [80,105], y in [13.85,54.15]
+        count = defensive_leakage(bx, by, team, 1, (80.0, 105.0), (13.85, 54.15))
+        assert count == 2
+
+    def test_opponent_outside_box(self):
+        """Ball outside the box is not counted even if opponent has possession."""
+        bx, by, team = self._make_arrays([50.0, 60.0], [34.0, 34.0], [1, 1])
+        count = defensive_leakage(bx, by, team, 1, (80.0, 105.0), (13.85, 54.15))
+        assert count == 0
+
+    def test_own_team_in_box_not_counted(self):
+        """Own-team possession inside the box is not leakage."""
+        bx, by, team = self._make_arrays([90.0], [34.0], [0])
+        count = defensive_leakage(bx, by, team, 1, (80.0, 105.0), (13.85, 54.15))
+        assert count == 0
+
+    def test_empty_arrays_return_zero(self):
+        bx, by, team = self._make_arrays([], [], [])
+        count = defensive_leakage(bx, by, team, 1, (80.0, 105.0), (13.85, 54.15))
+        assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# vertical_lane_density
+# ---------------------------------------------------------------------------
+
+class TestVerticalLaneDensity:
+    """vertical_lane_density splits a dimension into N equal lanes."""
+
+    def test_equal_distribution(self):
+        """Positions uniformly spread across 5 lanes → equal counts."""
+        # 5 lanes of 10 m each (50 m total), 2 positions per lane
+        positions = np.array([5.0, 5.0, 15.0, 15.0, 25.0, 25.0, 35.0, 35.0, 45.0, 45.0])
+        counts = vertical_lane_density(positions, pitch_dim_m=50.0, n_lanes=5)
+        np.testing.assert_array_equal(counts, [2, 2, 2, 2, 2])
+
+    def test_boundary_clamped_to_last_lane(self):
+        """A position exactly at pitch_dim_m falls in the last lane."""
+        counts = vertical_lane_density(np.array([68.0]), pitch_dim_m=68.0, n_lanes=5)
+        assert counts[4] == 1
+        assert counts[:4].sum() == 0
+
+    def test_output_shape(self):
+        """Returns an array of length n_lanes."""
+        counts = vertical_lane_density(np.arange(20, dtype=float), pitch_dim_m=68.0, n_lanes=5)
+        assert counts.shape == (5,)
+
+    def test_total_count_matches_input(self):
+        """Sum of all lane counts equals number of input positions."""
+        positions = np.random.uniform(0, 68, 100)
+        counts = vertical_lane_density(positions, pitch_dim_m=68.0, n_lanes=5)
+        assert counts.sum() == 100
+
+    def test_single_lane(self):
+        """n_lanes=1 puts everything in a single bucket."""
+        counts = vertical_lane_density(np.array([10.0, 30.0, 60.0]), 68.0, n_lanes=1)
+        assert counts.shape == (1,)
+        assert counts[0] == 3
+
+
+# ---------------------------------------------------------------------------
+# possession_by_thirds
+# ---------------------------------------------------------------------------
+
+class TestPossessionByThirds:
+    """possession_by_thirds calculates possession % per pitch third."""
+
+    def test_all_in_defensive_third(self):
+        """Ball always in defensive third for the team → 100% defensive."""
+        bx = np.array([10.0, 15.0, 20.0])
+        team = np.array([0, 0, 0])
+        d, m, a = possession_by_thirds(bx, pitch_length_m=105.0, team_possession=team,
+                                       team_id=0)
+        assert abs(d - 100.0) < 1e-9
+        assert m == 0.0
+        assert a == 0.0
+
+    def test_all_in_attacking_third(self):
+        """Ball always in attacking third → 100% attacking."""
+        bx = np.array([80.0, 90.0, 100.0])
+        team = np.array([0, 0, 0])
+        d, m, a = possession_by_thirds(bx, pitch_length_m=105.0, team_possession=team,
+                                       team_id=0)
+        assert d == 0.0
+        assert m == 0.0
+        assert abs(a - 100.0) < 1e-9
+
+    def test_even_distribution(self):
+        """One frame per third → ~33.3% each."""
+        bx = np.array([17.5, 52.5, 87.5])
+        team = np.array([0, 0, 0])
+        d, m, a = possession_by_thirds(bx, pitch_length_m=105.0, team_possession=team,
+                                       team_id=0)
+        assert abs(d - 100.0 / 3) < 1e-6
+        assert abs(m - 100.0 / 3) < 1e-6
+        assert abs(a - 100.0 / 3) < 1e-6
+
+    def test_only_own_team_frames_counted(self):
+        """Frames belonging to the other team are excluded."""
+        bx = np.array([10.0, 80.0, 50.0])
+        team = np.array([0, 1, 0])
+        # Frames 0 and 2 belong to team 0: x=10 (defensive), x=50 (middle)
+        d, m, a = possession_by_thirds(bx, pitch_length_m=105.0, team_possession=team,
+                                       team_id=0)
+        assert abs(d - 50.0) < 1e-9
+        assert abs(m - 50.0) < 1e-9
+        assert a == 0.0
+
+    def test_no_possession_returns_zeros(self):
+        """Team has no possession frames → (0, 0, 0)."""
+        bx = np.array([50.0, 50.0])
+        team = np.array([1, 1])
+        result = possession_by_thirds(bx, 105.0, team, team_id=0)
+        assert result == (0.0, 0.0, 0.0)
+
+    def test_percentages_sum_to_100(self):
+        """The three percentages always sum to 100 when team has possession."""
+        bx = np.random.uniform(0, 105, 50)
+        team = np.zeros(50, dtype=int)
+        d, m, a = possession_by_thirds(bx, 105.0, team, team_id=0)
+        assert abs(d + m + a - 100.0) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# team_compactness
+# ---------------------------------------------------------------------------
+
+class TestTeamCompactness:
+    """team_compactness returns the bounding-box area of player positions."""
+
+    def test_simple_rectangle(self):
+        """Four corners of a known rectangle → correct area."""
+        pts = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [0.0, 5.0]])
+        assert abs(team_compactness(pts) - 50.0) < 1e-9
+
+    def test_single_player_returns_zero(self):
+        """A single player has zero bounding-box area."""
+        pts = np.array([[50.0, 34.0]])
+        assert team_compactness(pts) == 0.0
+
+    def test_two_players_on_a_line(self):
+        """Two players on the same Y → height=0 → area=0."""
+        pts = np.array([[10.0, 34.0], [20.0, 34.0]])
+        assert team_compactness(pts) == 0.0
+
+    def test_empty_positions(self):
+        """Empty array returns 0."""
+        assert team_compactness(np.empty((0, 2))) == 0.0
+
+    def test_wrong_shape_returns_zero(self):
+        """1-D or (N,3) arrays return 0 without raising."""
+        assert team_compactness(np.array([1.0, 2.0, 3.0])) == 0.0
+        assert team_compactness(np.ones((5, 3))) == 0.0
+
+    def test_larger_spread_gives_larger_area(self):
+        """More spread-out players produce a larger area."""
+        compact = np.array([[48.0, 32.0], [52.0, 36.0], [50.0, 34.0], [49.0, 33.0]])
+        spread = np.array([[20.0, 10.0], [85.0, 10.0], [85.0, 58.0], [20.0, 58.0]])
+        assert team_compactness(spread) > team_compactness(compact)
+
+
+# ---------------------------------------------------------------------------
+# space_creation
+# ---------------------------------------------------------------------------
+
+class TestSpaceCreation:
+    """space_creation measures attacker–defensive-centroid distance."""
+
+    def test_known_distance(self):
+        """Attacker at (80,34) with all defenders at (50,34) → 30 m."""
+        attacker = np.array([80.0, 34.0])
+        defenders = np.array([[50.0, 34.0], [50.0, 34.0], [50.0, 34.0]])
+        assert abs(space_creation(attacker, defenders) - 30.0) < 1e-9
+
+    def test_attacker_at_centroid_is_zero(self):
+        """Attacker at the centroid → 0 distance."""
+        defenders = np.array([[40.0, 20.0], [60.0, 20.0], [50.0, 40.0]])
+        centroid = defenders.mean(axis=0)
+        assert abs(space_creation(centroid, defenders)) < 1e-9
+
+    def test_empty_defenders_returns_zero(self):
+        """No defenders → returns 0."""
+        assert space_creation(np.array([80.0, 34.0]), np.empty((0, 2))) == 0.0
+
+    def test_single_defender(self):
+        """Single defender: distance equals Euclidean dist to that defender."""
+        attacker = np.array([3.0, 4.0])
+        defenders = np.array([[0.0, 0.0]])
+        assert abs(space_creation(attacker, defenders) - 5.0) < 1e-9
+
+    def test_wrong_shape_returns_zero(self):
+        """Defender array with wrong shape returns 0 without raising."""
+        assert space_creation(np.array([50.0, 34.0]), np.ones((4,))) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# expected_threat
+# ---------------------------------------------------------------------------
+
+class TestExpectedThreat:
+    """expected_threat returns xT values that increase towards the opponent goal."""
+
+    def test_attacking_zone_higher_than_defensive(self):
+        """xT near the opponent goal is greater than xT near own goal."""
+        xt_att = expected_threat(100.0, 34.0, 105.0, 68.0)
+        xt_def = expected_threat(5.0, 34.0, 105.0, 68.0)
+        assert xt_att > xt_def
+
+    def test_centre_higher_than_wide(self):
+        """Central positions in the attacking third have higher xT than wide."""
+        xt_centre = expected_threat(90.0, 34.0, 105.0, 68.0)
+        xt_wide = expected_threat(90.0, 5.0, 105.0, 68.0)
+        assert xt_centre > xt_wide
+
+    def test_out_of_bounds_returns_zero(self):
+        """Positions outside the pitch boundaries return 0."""
+        assert expected_threat(-1.0, 34.0, 105.0, 68.0) == 0.0
+        assert expected_threat(110.0, 34.0, 105.0, 68.0) == 0.0
+        assert expected_threat(52.5, -5.0, 105.0, 68.0) == 0.0
+        assert expected_threat(52.5, 80.0, 105.0, 68.0) == 0.0
+
+    def test_values_in_unit_range(self):
+        """All xT values lie in [0, 1]."""
+        xs = np.linspace(0, 105, 20)
+        ys = np.linspace(0, 68, 12)
+        for x in xs:
+            for y in ys:
+                v = expected_threat(x, y, 105.0, 68.0)
+                assert 0.0 <= v <= 1.0, f"xT={v} at ({x},{y}) is outside [0,1]"
+
+    def test_custom_grid_respected(self):
+        """A custom 2×2 xT grid overrides the default grid."""
+        custom = np.array([[0.1, 0.9], [0.2, 0.8]])
+        # Top-left zone: row 0, col 0 → 0.1  (y=0.1 → row=0, x=0.1 → col=0)
+        v = expected_threat(0.1, 0.1, 2.0, 2.0, xt_grid=custom)
+        assert abs(v - 0.1) < 1e-9
+        # Top-right zone: row 0, col 1 → 0.9  (x=1.9 → col=1)
+        v2 = expected_threat(1.9, 0.1, 2.0, 2.0, xt_grid=custom)
+        assert abs(v2 - 0.9) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# pitch_width_utilization
+# ---------------------------------------------------------------------------
+
+class TestPitchWidthUtilization:
+    """pitch_width_utilization returns percentage activity per vertical lane."""
+
+    def test_sums_to_100(self):
+        """Percentages across all lanes sum to exactly 100."""
+        positions = np.random.uniform(0, 68, 50)
+        pct = pitch_width_utilization(positions, pitch_width_m=68.0, n_lanes=5)
+        assert abs(pct.sum() - 100.0) < 1e-9
+
+    def test_all_in_one_lane(self):
+        """All positions in one lane → that lane is 100%, others 0%."""
+        positions = np.array([5.0, 6.0, 7.0])  # all in lane 0 of [0,68)/5
+        pct = pitch_width_utilization(positions, pitch_width_m=68.0, n_lanes=5)
+        assert abs(pct[0] - 100.0) < 1e-9
+        assert pct[1:].sum() == 0.0
+
+    def test_output_shape(self):
+        """Returns array of length n_lanes."""
+        pct = pitch_width_utilization(np.arange(20, dtype=float), 68.0, n_lanes=5)
+        assert pct.shape == (5,)
+
+    def test_empty_positions_returns_zeros(self):
+        """Empty positions → all-zero percentages."""
+        pct = pitch_width_utilization(np.array([]), 68.0, n_lanes=5)
+        np.testing.assert_array_equal(pct, np.zeros(5))
+
+    def test_equal_distribution(self):
+        """Perfectly uniform distribution → each lane gets 20%."""
+        # 5 lanes × 2 positions each
+        positions = np.array([6.0, 6.0, 20.0, 20.0, 34.0, 34.0, 48.0, 48.0, 62.0, 62.0])
+        pct = pitch_width_utilization(positions, pitch_width_m=68.0, n_lanes=5)
+        np.testing.assert_allclose(pct, [20.0, 20.0, 20.0, 20.0, 20.0], atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# _arr_summary helper
+# ---------------------------------------------------------------------------
+
+class TestArrSummary:
+    """_arr_summary returns correct descriptive stats and is JSON-safe."""
+
+    def test_empty_array_returns_none_fields(self):
+        result = _arr_summary(np.array([]), 4)
+        assert result["count"] == 0
+        for key in ("mean", "std", "min", "max", "median"):
+            assert result[key] is None
+
+    def test_single_value(self):
+        result = _arr_summary(np.array([7.0]), 4)
+        assert result["count"] == 1
+        assert result["mean"] == 7.0
+        assert result["std"] == 0.0
+        assert result["min"] == 7.0
+        assert result["max"] == 7.0
+        assert result["median"] == 7.0
+
+    def test_known_values(self):
+        """[1, 2, 3, 4, 5] → mean=3, std=√2≈1.4142, min=1, max=5, median=3."""
+        result = _arr_summary(np.array([1.0, 2.0, 3.0, 4.0, 5.0]), 6)
+        assert result["count"] == 5
+        assert result["mean"] == 3.0
+        assert abs(result["std"] - round(float(np.std([1, 2, 3, 4, 5], ddof=0)), 6)) < 1e-9
+        assert result["min"] == 1.0
+        assert result["max"] == 5.0
+        assert result["median"] == 3.0
+
+    def test_rounding_respected(self):
+        """Values are rounded to the requested decimal places."""
+        result = _arr_summary(np.array([1.0 / 3.0, 2.0 / 3.0]), 2)
+        assert result["mean"] == round(0.5, 2)
+        assert isinstance(result["mean"], float)
+
+    def test_all_values_are_native_python_types(self):
+        """Output must be JSON-serializable (no numpy scalars)."""
+        result = _arr_summary(np.array([1.0, 2.0, 3.0]), 4)
+        assert isinstance(result["count"], int)
+        for key in ("mean", "std", "min", "max", "median"):
+            assert isinstance(result[key], float)
+
+    def test_population_std(self):
+        """std uses ddof=0 (population formula)."""
+        arr = np.array([2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0])
+        result = _arr_summary(arr, 10)
+        expected_std = float(np.std(arr, ddof=0))
+        assert abs(result["std"] - round(expected_std, 10)) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# build_match_report – structure and basic correctness
+# ---------------------------------------------------------------------------
+
+def _make_report(n: int = 300, seed: int = 0, fps: float = 25.0, **kwargs) -> dict:
+    """Helper: generate synthetic data and call build_match_report."""
+    rng = np.random.default_rng(seed)
+    bx = rng.uniform(0, 105, n)
+    by = rng.uniform(0, 68, n)
+    poss = rng.choice([-1, 0, 1], size=n, p=[0.1, 0.45, 0.45])
+    return build_match_report(bx, by, poss, fps=fps, **kwargs)
+
+
+class TestBuildMatchReportStructure:
+    """Verify the top-level keys and nested structure of the report."""
+
+    _TOP_KEYS = {
+        "meta",
+        "possession",
+        "passes",
+        "ball_progression",
+        "ball_position_stats",
+        "possession_by_thirds",
+        "defensive_leakage",
+        "pitch_width_utilization",
+        "expected_threat",
+        "team_compactness",
+        "team_separation",
+    }
+
+    def test_all_top_level_keys_present(self):
+        report = _make_report()
+        assert set(report.keys()) == self._TOP_KEYS
+
+    def test_meta_fields(self):
+        report = _make_report(n=250, fps=30.0)
+        meta = report["meta"]
+        assert meta["total_frames"] == 250
+        assert meta["fps"] == 30.0
+        assert meta["pitch_length_m"] == 105.0
+        assert meta["pitch_width_m"] == 68.0
+        assert meta["n_lanes"] == 5
+        assert len(meta["lane_labels"]) == 5
+        assert "decimal_places" in meta
+
+    def test_meta_duration_correct(self):
+        report = _make_report(n=250, fps=25.0)
+        assert report["meta"]["duration_sec"] == round(250 / 25.0, 4)
+
+    def test_custom_team_labels(self):
+        report = _make_report(team_labels=("AlMereikh", "AlHilal"))
+        poss = report["possession"]
+        assert "AlMereikh" in poss
+        assert "AlHilal" in poss
+        prog = report["ball_progression"]
+        assert "AlMereikh" in prog
+        assert "AlHilal" in prog
+
+    def test_possession_has_contested_key(self):
+        assert "contested" in _make_report()["possession"]
+
+    def test_passes_section_has_team_keys(self):
+        report = _make_report(passes_team0=12, passes_team1=18,
+                              team_labels=("Home", "Away"))
+        assert report["passes"]["Home"] == 12
+        assert report["passes"]["Away"] == 18
+
+    def test_ball_progression_has_overall_key(self):
+        assert "overall" in _make_report()["ball_progression"]
+
+    def test_thirds_has_three_sub_keys(self):
+        report = _make_report()
+        for team_block in report["possession_by_thirds"].values():
+            assert "defensive_third" in team_block
+            assert "middle_third" in team_block
+            assert "attacking_third" in team_block
+
+    def test_compactness_none_without_positions(self):
+        report = _make_report()
+        assert report["team_compactness"]["team_0"] is None
+        assert report["team_compactness"]["team_1"] is None
+
+    def test_separation_none_without_positions(self):
+        assert _make_report()["team_separation"] is None
+
+    def test_xt_section_structure(self):
+        xt = _make_report()["expected_threat"]
+        assert "ball" in xt
+        assert "ball_during_team_0" in xt
+        assert "ball_during_team_1" in xt
+
+    def test_xt_has_total_xt(self):
+        xt = _make_report()["expected_threat"]
+        assert "total_xt" in xt["ball_during_team_0"]
+        assert "total_xt" in xt["ball_during_team_1"]
+
+
+class TestBuildMatchReportAccuracy:
+    """Verify numerical correctness of key stats."""
+
+    def _fixed_report(self):
+        bx = np.array([10.0, 20.0, 30.0, 40.0, 60.0, 80.0])
+        by = np.array([34.0, 34.0, 34.0, 34.0, 34.0, 34.0])
+        poss = np.array([0, 0, 0, 1, 1, 1])
+        return build_match_report(
+            bx, by, poss,
+            fps=25.0,
+            pitch_length_m=105.0,
+            pitch_width_m=68.0,
+            team_labels=("home", "away"),
+            play_directions=(1, -1),
+            decimal_places=6,
+        )
+
+    def test_possession_frame_counts(self):
+        r = self._fixed_report()
+        assert r["possession"]["home"]["frames"] == 3
+        assert r["possession"]["away"]["frames"] == 3
+
+    def test_possession_pct_of_total(self):
+        r = self._fixed_report()
+        assert abs(r["possession"]["home"]["pct_of_total"] - 50.0) < 1e-9
+        assert abs(r["possession"]["away"]["pct_of_total"] - 50.0) < 1e-9
+
+    def test_possession_pct_of_owned(self):
+        r = self._fixed_report()
+        assert abs(r["possession"]["home"]["pct_of_owned"] - 50.0) < 1e-9
+
+    def test_ball_progression_during_possession(self):
+        """Team 0 holds possession at frames 0,1,2: x=[10,20,30,40].
+        delta[0]=10, delta[1]=10, delta[2]=10 are all attributed to team 0
+        (poss_for_delta[0..2] == 0) → forward_m = 30."""
+        r = self._fixed_report()
+        home_prog = r["ball_progression"]["home"]
+        assert abs(home_prog["forward_m"] - 30.0) < 1e-9
+        assert home_prog["backward_m"] == 0.0
+        assert abs(home_prog["net_m"] - 30.0) < 1e-9
+
+    def test_ball_progression_opponent_direction(self):
+        """Team 1 (play_dir=-1): ball x=[40,60,80] → delta=[20,20] × -1 = -20 each → backward."""
+        r = self._fixed_report()
+        away_prog = r["ball_progression"]["away"]
+        # delta[3]=20, delta[4]=20 (poss at frame 3 and 4 is 1)
+        # play_dir=-1 → d = -20 each → backward_m=40
+        assert abs(away_prog["backward_m"] - 40.0) < 1e-9
+        assert away_prog["forward_m"] == 0.0
+
+    def test_possession_by_thirds_all_defensive(self):
+        """Ball at x=[10,20,30] (all in defensive third for 105m pitch)."""
+        r = self._fixed_report()
+        # third = 105/3 = 35m; x<35 → defensive
+        home = r["possession_by_thirds"]["home"]
+        assert abs(home["defensive_third"]["pct"] - 100.0) < 1e-9
+        assert abs(home["middle_third"]["pct"]) < 1e-9
+        assert abs(home["attacking_third"]["pct"]) < 1e-9
+
+    def test_thirds_pct_sum_to_100(self):
+        r = _make_report(n=300)
+        for team_block in r["possession_by_thirds"].values():
+            total = (
+                team_block["defensive_third"]["pct"]
+                + team_block["middle_third"]["pct"]
+                + team_block["attacking_third"]["pct"]
+            )
+            assert abs(total - 100.0) < 1e-6 or total == 0.0
+
+    def test_duration_sec_uses_fps(self):
+        r = self._fixed_report()
+        assert abs(r["meta"]["duration_sec"] - 6 / 25.0) < 1e-9
+
+    def test_decimal_places_respected(self):
+        bx = np.array([52.5, 52.5])
+        by = np.array([34.0, 34.0])
+        poss = np.array([0, 0])
+        r = build_match_report(bx, by, poss, decimal_places=2)
+        # Ball progression forward_m should be rounded to 2 decimal places
+        val = r["ball_progression"]["overall"]["forward_m"]
+        assert val == round(val, 2)
+
+    def test_total_xt_is_sum_of_per_frame_xt(self):
+        """total_xt must equal sum of per-frame xT values for that team."""
+        bx = np.array([90.0, 92.0, 94.0, 80.0, 85.0])
+        by = np.array([34.0, 34.0, 34.0, 34.0, 34.0])
+        poss = np.array([0, 0, 0, 1, 1])
+        r = build_match_report(bx, by, poss, decimal_places=8)
+        expected_t0 = round(sum(
+            expected_threat(float(x), float(y), 105.0, 68.0)
+            for x, y in zip([90.0, 92.0, 94.0], [34.0, 34.0, 34.0])
+        ), 8)
+        assert abs(r["expected_threat"]["ball_during_team_0"]["total_xt"] - expected_t0) < 1e-6
+
+
+class TestBuildMatchReportJsonSerializable:
+    """The full report must survive json.dumps without errors."""
+
+    def test_basic_report_serializable(self):
+        json.dumps(_make_report())
+
+    def test_report_with_positions_serializable(self):
+        rng = np.random.default_rng(1)
+        n = 100
+        bx = rng.uniform(0, 105, n)
+        by = rng.uniform(0, 68, n)
+        poss = rng.choice([0, 1], size=n)
+        t0_pos = [rng.uniform(0, 105, (5, 2)) for _ in range(n)]
+        t1_pos = [rng.uniform(0, 105, (5, 2)) for _ in range(n)]
+        r = build_match_report(
+            bx, by, poss,
+            team0_positions_per_frame=t0_pos,
+            team1_positions_per_frame=t1_pos,
+        )
+        json.dumps(r)
+
+    def test_edge_case_all_contested_serializable(self):
+        bx = np.array([52.5, 52.5, 52.5])
+        by = np.array([34.0, 34.0, 34.0])
+        poss = np.array([-1, -1, -1])
+        json.dumps(build_match_report(bx, by, poss))
+
+    def test_single_frame_serializable(self):
+        json.dumps(build_match_report(
+            np.array([52.5]), np.array([34.0]), np.array([0])
+        ))
+
+    def test_empty_arrays_serializable(self):
+        json.dumps(build_match_report(
+            np.array([]), np.array([]), np.array([])
+        ))
+
+
+class TestBuildMatchReportWithPositions:
+    """Tests for compactness and separation sections when positions are supplied."""
+
+    def _report_with_positions(self, n: int = 20):
+        rng = np.random.default_rng(42)
+        bx = rng.uniform(0, 105, n)
+        by = rng.uniform(0, 68, n)
+        poss = rng.choice([0, 1], size=n)
+        t0_pos = [rng.uniform([20, 10], [50, 58], (6, 2)) for _ in range(n)]
+        t1_pos = [rng.uniform([55, 10], [85, 58], (6, 2)) for _ in range(n)]
+        return build_match_report(
+            bx, by, poss,
+            team0_positions_per_frame=t0_pos,
+            team1_positions_per_frame=t1_pos,
+        )
+
+    def test_compactness_not_none(self):
+        r = self._report_with_positions()
+        assert r["team_compactness"]["team_0"] is not None
+        assert r["team_compactness"]["team_1"] is not None
+
+    def test_compactness_structure(self):
+        r = self._report_with_positions()
+        block = r["team_compactness"]["team_0"]
+        for key in ("count", "mean", "std", "min", "max", "median"):
+            assert key in block
+
+    def test_compactness_count_matches_frames(self):
+        n = 20
+        r = self._report_with_positions(n=n)
+        assert r["team_compactness"]["team_0"]["count"] == n
+
+    def test_separation_not_none(self):
+        assert self._report_with_positions()["team_separation"] is not None
+
+    def test_separation_structure(self):
+        sep = self._report_with_positions()["team_separation"]
+        for key in ("count", "mean", "std", "min", "max", "median"):
+            assert key in sep
+
+    def test_separation_positive(self):
+        """Centroid distance must be non-negative."""
+        sep = self._report_with_positions()["team_separation"]
+        assert sep["min"] >= 0.0
+        assert sep["mean"] >= 0.0
+
+    def test_player_lane_keys_present(self):
+        r = self._report_with_positions()
+        wu = r["pitch_width_utilization"]
+        assert "team_0_players" in wu
+        assert "team_1_players" in wu
+
+    def test_player_lane_pcts_sum_to_100(self):
+        r = self._report_with_positions()
+        for key in ("team_0_players", "team_1_players"):
+            total_pct = sum(
+                lane["pct"] for lane in r["pitch_width_utilization"][key].values()
+            )
+            # Tolerance: rounding to decimal_places=4 across 5 lanes can
+            # introduce up to 5 × 0.00005 = 0.00025 accumulated error.
+            assert abs(total_pct - 100.0) < 1e-3
+
+
+class TestBuildMatchReportEdgeCases:
+    """Edge cases: empty data, all-contested, custom parameters."""
+
+    def test_empty_returns_correct_structure(self):
+        r = build_match_report(np.array([]), np.array([]), np.array([]))
+        assert r["meta"]["total_frames"] == 0
+        assert r["meta"]["duration_sec"] == 0.0
+
+    def test_all_contested_possession_is_zero(self):
+        bx = np.array([52.5, 52.5])
+        by = np.array([34.0, 34.0])
+        poss = np.array([-1, -1])
+        r = build_match_report(bx, by, poss)
+        assert r["possession"]["team_0"]["frames"] == 0
+        assert r["possession"]["team_1"]["frames"] == 0
+
+    def test_custom_n_lanes(self):
+        r = _make_report(n_lanes=3)
+        assert r["meta"]["n_lanes"] == 3
+        assert len(r["meta"]["lane_labels"]) == 3
+        assert len(r["pitch_width_utilization"]["ball"]) == 3
+
+    def test_custom_play_direction_flips_progression(self):
+        """Increasing X with play_direction=-1 is backward movement."""
+        bx = np.array([10.0, 20.0, 30.0])
+        by = np.array([34.0, 34.0, 34.0])
+        poss = np.array([0, 0, 0])
+        r = build_match_report(bx, by, poss, play_directions=(-1, 1))
+        prog = r["ball_progression"]["team_0"]
+        assert prog["backward_m"] == 20.0
+        assert prog["forward_m"] == 0.0
+
+    def test_possession_pct_of_owned_sums_to_100(self):
+        bx = np.ones(10) * 52.5
+        by = np.ones(10) * 34.0
+        poss = np.array([0, 0, 0, 0, 1, 1, 1, 1, 1, 1])
+        r = build_match_report(bx, by, poss)
+        t0 = r["possession"]["team_0"]["pct_of_owned"]
+        t1 = r["possession"]["team_1"]["pct_of_owned"]
+        assert abs(t0 + t1 - 100.0) < 1e-6
+
+    def test_defensive_leakage_counts_correctly(self):
+        """Opponent (team 1) has ball 2 frames inside team 0's penalty box."""
+        bx = np.array([5.0, 10.0, 50.0])    # first two in left penalty area
+        by = np.array([34.0, 34.0, 34.0])
+        poss = np.array([1, 1, 0])           # team 1 has ball in first two frames
+        r = build_match_report(bx, by, poss, pitch_length_m=105.0, pitch_width_m=68.0,
+                               penalty_area_length_m=16.5, penalty_area_width_m=40.32)
+        leak = r["defensive_leakage"]["team_0_defensive_box"]
+        assert leak["frames_opponent_in_box"] == 2
+
+    def test_xT_grid_float64_precision(self):
+        """xT values from the default grid must be float64."""
+        import sports.common.stats as st
+        assert st._XT_GRID_16x12.dtype == np.float64
